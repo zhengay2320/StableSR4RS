@@ -1,0 +1,2 @@
+relative_path,lr_width,lr_height,gt_width,gt_height,mae_before,mae_after_geo,mae_after_geo_rad,flow_mean_lr_px,flow_p95_lr_px,flow_max_lr_px,status,error_message
+odd_37x39.png,39,37,156,148,0.007706030271947384,0.012647313065826893,0.009755902923643589,0.25118333101272583,0.4971330463886261,0.5774288177490234,success,
