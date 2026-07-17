@@ -1,0 +1,59 @@
+# PyCharm / IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+conda-env/
+
+# Training outputs
+outputs/
+checkpoints/
+training_state/
+logs/
+wandb/
+runs/
+result/
+results/
+
+# Data
+data/
+dataset/
+datasets/
+
+# Model weights
+pretrained_models/
+weights/
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.onnx
+
+# Hugging Face cache
+.cache/
+huggingface/
+hf_cache/
+
+# Git backup files
+*.bundle
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# OS
+.DS_Store
+Thumbs.db

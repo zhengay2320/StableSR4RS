@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Virtual environments
+.venv/
+venv/
+env/
+conda-env/
+
+# Training outputs
+outputs/
+checkpoints/
+training_state/
+logs/
+wandb/
+runs/
+result/
+results/
+
+# Datasets
+data/
+dataset/
+datasets/
+
+# Pretrained model weights
+pretrained_models/
+weights/
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.onnx
+
+# Hugging Face cache
+.cache/
+huggingface/
+hf_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local backup
+diffusers-local-backup.bundle
+# Local Git repository backups
+*.bundle
+
+# Git repository backups
+*.bundle
+
+# Local Git repository backups
+*.bundle

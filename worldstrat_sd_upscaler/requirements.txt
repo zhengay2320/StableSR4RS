@@ -1,0 +1,16 @@
+# Install a CUDA-compatible torch build separately before this file.
+transformers
+accelerate
+peft
+safetensors
+torchvision
+Pillow
+numpy
+pandas
+PyYAML
+tqdm
+tensorboard
+scikit-image
+lpips
+pytest
+

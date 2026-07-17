@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "worldstrat-sd-upscaler"
+version = "0.1.0"
+description = "Two-stage LoRA domain adaptation for the Stable Diffusion x4 Upscaler on WorldStrat"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+  "transformers",
+  "accelerate",
+  "peft",
+  "safetensors",
+  "torchvision",
+  "Pillow",
+  "numpy",
+  "pandas",
+  "PyYAML",
+  "tqdm",
+  "tensorboard",
+  "scikit-image",
+]
+
+[project.optional-dependencies]
+eval = ["lpips"]
+memory = ["bitsandbytes", "xformers"]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
