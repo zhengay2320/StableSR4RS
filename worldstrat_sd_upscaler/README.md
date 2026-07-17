@@ -284,3 +284,29 @@ LoRA and adapter optimization, noise ranges, prompt/dropout behavior, precision 
 checkpoint/validation cadence, SNR gamma, and seed. Actual resolved configuration is copied into
 each run and artifact directory. Metadata prompts are optional: when `final_metadata.csv` or its
 required fields are absent, the fixed prompt is used without interrupting training.
+
+## Clean-latent reliability across diffusion timesteps
+
+The post-training diagnostic below fixes one aligned synthetic validation pair, one VAE latent
+sample, one diffusion noise tensor, and one noisy LR condition while evaluating every training
+timestep. It converts the scheduler's actual `epsilon`, `v_prediction`, or clean-sample output to
+an estimated clean latent, decodes both `z_t` and the estimated clean latent with the pipeline VAE,
+and writes full metrics plus representative visualizations:
+
+```bash
+python scripts/analyze_z0_reliability.py \
+  --config stage1_synthetic.yaml \
+  --checkpoint outputs/stage1_synthetic/final \
+  --num_samples 1 --noise_seed 1234 --timestep_stride 1
+```
+
+Results default to `outputs/z0_reliability/stage1_synthetic_final/`. Use a larger
+`--timestep_stride` for a quick pipeline check. LPIPS is used when its optional dependency and
+backbone are available; pass `--skip_lpips` for an entirely offline run.
+
+The same command also runs a second, inference-faithful trajectory from a Gaussian latent that is
+independent of HR. It records the formula-derived clean prediction before every scheduler step in
+`pure_noise_trajectory/metrics.csv` and `pure_noise_trajectory_grid.png`. In that trajectory HR is
+used only after prediction as a visual/metric reference. To disable the HR-derived forward-noising
+probe and run only this pure-noise path, add `--skip_training_timestep_analysis`; control the
+trajectory length with `--num_inference_steps` (default: the validation setting in the YAML).

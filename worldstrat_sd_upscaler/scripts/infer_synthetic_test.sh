@@ -6,5 +6,5 @@ ARTIFACT_PATH="${ARTIFACT_PATH:-outputs/stage1_synthetic/final}"
 python src/infer_upscaler.py \
   --config configs/stage1_synthetic.yaml \
   --checkpoint_path "${ARTIFACT_PATH}" \
-  --input_dir "${DATA_ROOT}/test/LR_bicubic" --gt_dir "${DATA_ROOT}/test/GT" \
+  --input_dir "${DATA_ROOT}/test/LR_bicubic" --gt_dir "${DATA_ROOT}/test/GT_geo_rad_visual" \
   --output_dir outputs/inference_stage1_synthetic "$@"

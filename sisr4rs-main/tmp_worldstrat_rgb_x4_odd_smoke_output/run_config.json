@@ -1,0 +1,50 @@
+{
+  "input_root": "D:\\code_compare\\StableDiffushion\\sisr4rs-main\\tmp_worldstrat_rgb_x4_odd_smoke",
+  "lr_dir_name": "LR",
+  "gt_dir_name": "GT",
+  "output_root": "D:\\code_compare\\StableDiffushion\\sisr4rs-main\\tmp_worldstrat_rgb_x4_odd_smoke_output",
+  "checkpoint": "D:\\code_compare\\StableDiffushion\\sisr4rs-main\\pretrained\\registration\\wsx4_registration_model.ckpt",
+  "checkpoint_sha256": "fda1bcfd6c0d0566cbf0822a49b3ffb666d64650c5af33035e53c49f8d624aac",
+  "checkpoint_size_bytes": 90599112,
+  "official_checkpoint_archive_url": "https://zenodo.org/records/14734095/files/pretrained_registration_models.tar.gz?download=1",
+  "scale": 4,
+  "mtf": 0.4,
+  "registration_channel": 0,
+  "max_offset": 20.0,
+  "model_structure": {
+    "class": "torchsisr.registration.UnetOpticalFlowEstimation",
+    "depth": 4,
+    "min_skip_depth": 2,
+    "num_features": 64
+  },
+  "python_version": "3.10.20",
+  "python_executable": "C:\\Users\\45376\\anaconda3\\envs\\zhengay\\python.exe",
+  "pytorch_version": "2.11.0+cu128",
+  "cuda_available": true,
+  "device": "cuda",
+  "started_at_utc": "2026-07-20T03:41:00.879285+00:00",
+  "git_commit": "26f71dad224780e4f6603d017de5d9fb9f848cc9",
+  "radiometric_visual_correction_enabled": true,
+  "radiometric_note": "Low-frequency correction is performed in stretched display-RGB space; it is not a physical reflectance correction.",
+  "recursive": false,
+  "limit": 1,
+  "finished_at_utc": "2026-07-20T03:41:01.856689+00:00",
+  "elapsed_seconds": 0.9839999999967404,
+  "diagnostics": {
+    "successful": 1,
+    "skipped": 0,
+    "missing_gt": 0,
+    "size_mismatch": 0,
+    "processing_errors": 0,
+    "failed": 0,
+    "mae_after_geo_improved_fraction": 0.0,
+    "flow_p95_saturated_fraction": 0.0,
+    "flow_max_near_limit_samples": [],
+    "most_degraded_after_geo": [
+      {
+        "relative_path": "odd_37x39.png",
+        "mae_delta": 0.004941282793879509
+      }
+    ]
+  }
+}

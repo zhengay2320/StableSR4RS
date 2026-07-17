@@ -6,5 +6,9 @@ ARTIFACT_PATH="${ARTIFACT_PATH:-outputs/stage2_cross_sensor/final}"
 python src/infer_upscaler.py \
   --config configs/stage2_cross_sensor.yaml \
   --checkpoint_path "${ARTIFACT_PATH}" \
+<<<<<<< HEAD
   --input_dir "${DATA_ROOT}/test/LR" --gt_dir "${DATA_ROOT}/test/GT" \
+=======
+  --input_dir "${DATA_ROOT}/test/LR" --gt_dir "${DATA_ROOT}/test/GT_geo_rad_visual" \
+>>>>>>> d040f50 (修改了部分方法)
   --output_dir outputs/inference_stage2_real "$@"

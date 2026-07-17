@@ -1,0 +1,15 @@
+2026-07-20 11:41:01,072 | INFO | Input LR: D:\code_compare\StableDiffushion\sisr4rs-main\tmp_worldstrat_rgb_x4_odd_smoke\LR
+2026-07-20 11:41:01,072 | INFO | Input GT: D:\code_compare\StableDiffushion\sisr4rs-main\tmp_worldstrat_rgb_x4_odd_smoke\GT
+2026-07-20 11:41:01,072 | INFO | Output: D:\code_compare\StableDiffushion\sisr4rs-main\tmp_worldstrat_rgb_x4_odd_smoke_output
+2026-07-20 11:41:01,072 | INFO | Checkpoint: D:\code_compare\StableDiffushion\sisr4rs-main\pretrained\registration\wsx4_registration_model.ckpt
+2026-07-20 11:41:01,072 | INFO | Checkpoint SHA256: fda1bcfd6c0d0566cbf0822a49b3ffb666d64650c5af33035e53c49f8d624aac
+2026-07-20 11:41:01,072 | INFO | Device: cuda
+2026-07-20 11:41:01,073 | INFO | Radiometric visual correction: enabled (stretched display RGB; not physical reflectance)
+2026-07-20 11:41:01,321 | INFO | Strictly loaded registration weights using prefix 'registration_module.'
+2026-07-20 11:41:01,322 | INFO | LR files selected: 1
+2026-07-20 11:41:01,840 | INFO | [1/1] odd_37x39.png | MAE 0.0077 -> 0.0126 | flow p95=0.50px
+2026-07-20 11:41:01,856 | INFO | Summary: success=1 skipped=0 missing_gt=0 size_mismatch=0 processing_errors=0
+2026-07-20 11:41:01,856 | INFO | MAE improved after geometry: 0.0%; flow p95 > 0.9*max_offset: 0.0%
+2026-07-20 11:41:01,856 | INFO | Geometry MAE degradation: odd_37x39.png delta=+0.004941
+2026-07-20 11:41:01,857 | INFO | Metrics: D:\code_compare\StableDiffushion\sisr4rs-main\tmp_worldstrat_rgb_x4_odd_smoke_output\metrics.csv
+2026-07-20 11:41:01,857 | INFO | Visual summary: D:\code_compare\StableDiffushion\sisr4rs-main\tmp_worldstrat_rgb_x4_odd_smoke_output\summary_grid.png
