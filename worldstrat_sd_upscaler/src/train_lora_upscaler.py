@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from PIL import Image
 from torch import nn
 from torch.optim import Optimizer
@@ -26,6 +26,13 @@ if __package__ in {None, ""}:
 
 from src.condition_adapter import ConditionAdapter
 from src.dataset import PairedSatelliteDataset
+from src.diffusion_prediction import (
+    alpha_bar_for_timesteps,
+    model_output_to_x0,
+    normalized_timesteps,
+    validate_timestep_range,
+)
+from src.latent_phi import LatentPhi, compute_phi_training_losses
 from src.metrics import psnr, ssim
 from src.utils import (
     FIXED_PROMPT,
@@ -170,6 +177,7 @@ def save_artifacts(
     global_step: int,
     optimizer: Optimizer | None = None,
     lr_scheduler: Any | None = None,
+    phi: nn.Module | None = None,
 ) -> None:
     """Save reloadable Diffusers LoRA, adapter, actual config, and trainer state."""
     if not accelerator.is_main_process:
@@ -192,6 +200,11 @@ def save_artifacts(
     if not isinstance(unwrapped_adapter, ConditionAdapter):
         raise TypeError(f"Unexpected adapter type: {type(unwrapped_adapter)}")
     unwrapped_adapter.save_pretrained(output_path)
+    if phi is not None:
+        unwrapped_phi = accelerator.unwrap_model(phi)
+        if not isinstance(unwrapped_phi, LatentPhi):
+            raise TypeError(f"Unexpected latent phi type: {type(unwrapped_phi)}")
+        unwrapped_phi.save_pretrained(output_path)
     save_yaml(config, output_path / "training_config.yaml")
     save_json(
         {
@@ -358,12 +371,32 @@ def main() -> None:
         raise ValueError("Stable Diffusion x4 upscaler requires scale=4")
     if int(config.get("low_res_noise_level_min", 0)) > int(config.get("low_res_noise_level_max", 20)):
         raise ValueError("low_res_noise_level_min must not exceed low_res_noise_level_max")
+    phi_enabled = bool(config.get("phi_enabled", False))
+    if phi_enabled:
+        validate_timestep_range(
+            config.get("phi_train_timestep_range", [0.0, 1.0]),
+            "phi_train_timestep_range",
+        )
+        validate_timestep_range(
+            config.get("phi_infer_timestep_range", [0.0, 1.0]),
+            "phi_infer_timestep_range",
+        )
+        if not 0.0 <= float(config.get("phi_weight", 1.0)) <= 1.0:
+            raise ValueError("phi_weight must be in [0,1] for the fixed convex mixture")
+        if float(config.get("lambda_z0", 1.0)) < 0 or float(config.get("lambda_lpips", 0.1)) < 0:
+            raise ValueError("lambda_z0 and lambda_lpips must be non-negative")
 
+    accelerator_options: dict[str, Any] = {}
+    if phi_enabled:
+        accelerator_options["kwargs_handlers"] = [
+            DistributedDataParallelKwargs(find_unused_parameters=True)
+        ]
     accelerator = Accelerator(
         gradient_accumulation_steps=int(config.get("gradient_accumulation_steps", 1)),
         mixed_precision=str(config.get("mixed_precision", "no")),
         log_with="tensorboard",
         project_config=ProjectConfiguration(project_dir=str(output_dir), logging_dir=str(output_dir / "logs")),
+        **accelerator_options,
     )
     if accelerator.is_main_process:
         save_yaml(config, output_dir / "training_config.yaml")
@@ -409,6 +442,34 @@ def main() -> None:
     else:
         adapter = ConditionAdapter(adapter_scale=float(config.get("adapter_scale", 1.0)))
 
+    phi: LatentPhi | None = None
+    differentiable_lpips: nn.Module | None = None
+    if phi_enabled:
+        if resume_path is not None:
+            phi = LatentPhi.from_pretrained(resume_path)
+            if int(phi.config["latent_channels"]) != int(pipe.vae.config.latent_channels):
+                raise ValueError(
+                    "LatentPhi checkpoint latent_channels does not match the loaded VAE: "
+                    f"{phi.config['latent_channels']} vs {pipe.vae.config.latent_channels}"
+                )
+            LOGGER.info("Initialized LatentPhi from %s", resume_path)
+        else:
+            phi = LatentPhi(
+                latent_channels=int(pipe.vae.config.latent_channels),
+                hidden_channels=int(config.get("phi_hidden_channels", 64)),
+                time_embed_dim=int(config.get("phi_time_embed_dim", 128)),
+                num_blocks=int(config.get("phi_num_blocks", 3)),
+            )
+        if float(config.get("lambda_lpips", 0.1)) > 0:
+            try:
+                import lpips  # type: ignore
+            except ImportError as error:
+                raise RuntimeError(
+                    "phi_enabled with lambda_lpips>0 requires the optional `lpips` package"
+                ) from error
+            differentiable_lpips = lpips.LPIPS(net="alex").eval()
+            differentiable_lpips.requires_grad_(False)
+
     with accelerator.main_process_first():
         train_dataset, validation_dataset = build_datasets(
             config, output_dir, write_invalid_logs=accelerator.is_main_process
@@ -434,11 +495,16 @@ def main() -> None:
         optimizer_class = bnb.optim.AdamW8bit
     else:
         optimizer_class = torch.optim.AdamW
+    parameter_groups: list[dict[str, Any]] = [
+        {"params": get_trainable_parameters(unet), "lr": float(config.get("learning_rate", 1e-4))},
+        {"params": list(adapter.parameters()), "lr": float(config.get("adapter_learning_rate", 1e-4))},
+    ]
+    if phi is not None:
+        parameter_groups.append(
+            {"params": list(phi.parameters()), "lr": float(config.get("phi_learning_rate", 1e-4))}
+        )
     optimizer = optimizer_class(
-        [
-            {"params": get_trainable_parameters(unet), "lr": float(config.get("learning_rate", 1e-4))},
-            {"params": list(adapter.parameters()), "lr": float(config.get("adapter_learning_rate", 1e-4))},
-        ],
+        parameter_groups,
         betas=(float(config.get("adam_beta1", 0.9)), float(config.get("adam_beta2", 0.999))),
         weight_decay=float(config.get("adam_weight_decay", 0.01)),
         eps=float(config.get("adam_epsilon", 1e-8)),
@@ -450,12 +516,19 @@ def main() -> None:
         num_warmup_steps=int(config.get("lr_warmup_steps", 0)) * accelerator.num_processes,
         num_training_steps=max_steps * accelerator.num_processes,
     )
-    unet, adapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, adapter, optimizer, train_dataloader, lr_scheduler
-    )
+    if phi is not None:
+        unet, adapter, phi, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, adapter, phi, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        unet, adapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, adapter, optimizer, train_dataloader, lr_scheduler
+        )
     vae_dtype = torch.float32
     pipe.vae.to(accelerator.device, dtype=vae_dtype)
     pipe.text_encoder.to(accelerator.device, dtype=weight_dtype)
+    if differentiable_lpips is not None:
+        differentiable_lpips.to(accelerator.device)
     if accelerator.is_main_process:
         LOGGER.info("Using VAE dtype %s for numerically stable latent encoding", vae_dtype)
 
@@ -480,14 +553,24 @@ def main() -> None:
     num_epochs = math.ceil(max_steps * int(config.get("gradient_accumulation_steps", 1)) / max(1, len(train_dataloader)))
     progress = tqdm(range(global_step, max_steps), disable=not accelerator.is_local_main_process, desc="training")
     warned_resize = False
+    accumulation_active_count = 0.0
+    accumulation_sample_count = 0.0
+    accumulation_phi_z0_sum = 0.0
+    accumulation_phi_lpips_sum = 0.0
+    accumulation_phi_total_sum = 0.0
+    accumulation_base_abs_sum = 0.0
+    accumulation_phi_abs_sum = 0.0
     unet.train()
     adapter.train()
+    if phi is not None:
+        phi.train()
 
     for _epoch in range(num_epochs):
         for batch in train_dataloader:
             if global_step >= max_steps:
                 break
-            with accelerator.accumulate(unet, adapter):
+            accumulation_modules = (unet, adapter, phi) if phi is not None else (unet, adapter)
+            with accelerator.accumulate(*accumulation_modules):
                 gt = batch["gt"].to(accelerator.device, dtype=vae_dtype)
                 lr = batch["lr"].to(accelerator.device, dtype=weight_dtype)
                 with torch.no_grad():
@@ -530,7 +613,7 @@ def main() -> None:
                     f"Condition/latent mismatch after compatibility handling: {noisy_low.shape} vs {noisy_latents.shape}"
                 )
                 model_input = torch.cat([noisy_latents, noisy_low], dim=1)
-                prediction = unet(
+                model_output = unet(
                     model_input,
                     timesteps,
                     encoder_hidden_states=prompt_embeds,
@@ -542,27 +625,75 @@ def main() -> None:
                     target = noise
                 elif prediction_type == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                elif prediction_type in {"sample", "x0", "x_start"}:
+                    target = latents
                 else:
                     raise ValueError(f"Unsupported scheduler prediction_type: {prediction_type}")
                 gamma_value = config.get("snr_gamma", 5.0)
-                loss = snr_weighted_mse(
-                    prediction,
+                diffusion_loss = snr_weighted_mse(
+                    model_output,
                     target,
                     timesteps,
                     noise_scheduler,
                     None if gamma_value is None else float(gamma_value),
                 )
+                zero = diffusion_loss.new_zeros(())
+                phi_results = {
+                    "loss": zero,
+                    "z0_loss": zero,
+                    "lpips_loss": zero,
+                    "active_count": zero,
+                    "active_fraction": zero,
+                    "weight_mean": zero,
+                    "base_z0_abs_mean": zero,
+                    "phi_z0_abs_mean": zero,
+                }
+                if phi is not None:
+                    alpha_bar = alpha_bar_for_timesteps(noise_scheduler, timesteps)
+                    base_z0 = model_output_to_x0(
+                        model_output, noisy_latents, alpha_bar, str(prediction_type)
+                    )
+                    normalized_t = normalized_timesteps(
+                        timesteps, int(noise_scheduler.config.num_train_timesteps)
+                    )
+                    phi_results = compute_phi_training_losses(
+                        phi=phi,
+                        predicted_z0=base_z0,
+                        target_z0=latents,
+                        normalized_t=normalized_t,
+                        target_rgb_minus_one_one=gt,
+                        vae=pipe.vae,
+                        lpips_model=differentiable_lpips,
+                        timestep_range=config.get("phi_train_timestep_range", [0.0, 1.0]),
+                        phi_weight=float(config.get("phi_weight", 1.0)),
+                        lambda_z0=float(config.get("lambda_z0", 1.0)),
+                        lambda_lpips=float(config.get("lambda_lpips", 0.1)),
+                        scaling_factor=float(pipe.vae.config.scaling_factor),
+                    )
+                loss = diffusion_loss + phi_results["loss"]
+                if phi is not None:
+                    micro_active = float(phi_results["active_count"].detach().item())
+                    micro_batch = float(latents.shape[0])
+                    accumulation_active_count += micro_active
+                    accumulation_sample_count += micro_batch
+                    accumulation_phi_z0_sum += float(phi_results["z0_loss"].detach().item()) * micro_active
+                    accumulation_phi_lpips_sum += float(phi_results["lpips_loss"].detach().item()) * micro_active
+                    accumulation_phi_total_sum += float(phi_results["loss"].detach().item()) * micro_batch
+                    accumulation_base_abs_sum += float(phi_results["base_z0_abs_mean"].detach().item()) * micro_batch
+                    accumulation_phi_abs_sum += float(phi_results["phi_z0_abs_mean"].detach().item()) * micro_active
                 if not torch.isfinite(loss):
                     raise FloatingPointError(
                         "Non-finite training loss detected before backward. "
                         f"loss={loss.detach().float().item()}, "
                         f"latents_finite={torch.isfinite(latents).all().item()}, "
-                        f"prediction_finite={torch.isfinite(prediction).all().item()}, "
+                        f"prediction_finite={torch.isfinite(model_output).all().item()}, "
                         f"target_finite={torch.isfinite(target).all().item()}"
                     )
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     parameters: Iterable[nn.Parameter] = list(get_trainable_parameters(unet)) + list(adapter.parameters())
+                    if phi is not None:
+                        parameters = list(parameters) + list(phi.parameters())
                     accelerator.clip_grad_norm_(parameters, float(config.get("max_grad_norm", 1.0)))
                 optimizer.step()
                 lr_scheduler.step()
@@ -572,14 +703,56 @@ def main() -> None:
                 global_step += 1
                 progress.update(1)
                 loss_value = accelerator.gather(loss.detach().reshape(1)).mean().item()
-                logs = {"train_loss": loss_value, "lr": lr_scheduler.get_last_lr()[0]}
+                logs = {
+                    "train_loss": loss_value,
+                    "lr": lr_scheduler.get_last_lr()[0],
+                }
+                if phi is not None:
+                    diffusion_value = accelerator.gather(
+                        diffusion_loss.detach().reshape(1)
+                    ).mean().item()
+                    gathered_count = accelerator.gather(
+                        torch.tensor([accumulation_active_count], device=latents.device)
+                    ).sum()
+                    gathered_batch = accelerator.gather(
+                        torch.tensor([accumulation_sample_count], device=latents.device)
+                    ).sum()
+                    active_fraction = float((gathered_count / gathered_batch.clamp_min(1)).item())
+                    def gathered_sum(value: float) -> torch.Tensor:
+                        return accelerator.gather(
+                            torch.tensor([value], device=latents.device)
+                        ).sum()
+
+                    logs.update(
+                        {
+                            "diffusion_loss": diffusion_value,
+                            "phi_z0_loss": float((gathered_sum(accumulation_phi_z0_sum) / gathered_count.clamp_min(1)).item()),
+                            "phi_lpips_loss": float((gathered_sum(accumulation_phi_lpips_sum) / gathered_count.clamp_min(1)).item()),
+                            "phi_total_loss": float((gathered_sum(accumulation_phi_total_sum) / gathered_batch.clamp_min(1)).item()),
+                            "phi_active_fraction": active_fraction,
+                            "phi_active_count": float(gathered_count.item()),
+                            "phi_weight_mean": active_fraction * float(config.get("phi_weight", 1.0)),
+                            "base_z0_abs_mean": float((gathered_sum(accumulation_base_abs_sum) / gathered_batch.clamp_min(1)).item()),
+                            "phi_z0_abs_mean": float((gathered_sum(accumulation_phi_abs_sum) / gathered_count.clamp_min(1)).item()),
+                        }
+                    )
+                    accumulation_active_count = 0.0
+                    accumulation_sample_count = 0.0
+                    accumulation_phi_z0_sum = 0.0
+                    accumulation_phi_lpips_sum = 0.0
+                    accumulation_phi_total_sum = 0.0
+                    accumulation_base_abs_sum = 0.0
+                    accumulation_phi_abs_sum = 0.0
                 progress.set_postfix(loss=f"{loss_value:.4f}")
                 accelerator.log(logs, step=global_step)
 
                 if global_step % int(config.get("checkpointing_steps", 1000)) == 0:
                     accelerator.wait_for_everyone()
                     checkpoint = output_dir / f"checkpoint-{global_step:05d}"
-                    save_artifacts(accelerator, unet, adapter, checkpoint, config, global_step, optimizer, lr_scheduler)
+                    save_artifacts(
+                        accelerator, unet, adapter, checkpoint, config, global_step,
+                        optimizer, lr_scheduler, phi=phi,
+                    )
                     if accelerator.is_main_process:
                         enforce_checkpoint_limit(output_dir, config.get("checkpoints_total_limit", 3))
                 if global_step % int(config.get("validation_steps", 1000)) == 0:
@@ -600,7 +773,10 @@ def main() -> None:
                 break
 
     accelerator.wait_for_everyone()
-    save_artifacts(accelerator, unet, adapter, output_dir / "final", config, global_step, optimizer, lr_scheduler)
+    save_artifacts(
+        accelerator, unet, adapter, output_dir / "final", config, global_step,
+        optimizer, lr_scheduler, phi=phi,
+    )
     accelerator.end_training()
 
 

@@ -310,3 +310,43 @@ independent of HR. It records the formula-derived clean prediction before every 
 used only after prediction as a visual/metric reference. To disable the HR-derived forward-noising
 probe and run only this pure-noise path, add `--skip_training_timestep_analysis`; control the
 trajectory length with `--num_inference_steps` (default: the validation setting in the YAML).
+
+## Stage 1 latent-phi timestep ablation
+
+`configs/stage1_synthetic_latent_phi.yaml` keeps the Stage 1 data, seed, LoRA, optimizer, steps,
+prompts, and validation settings unchanged while enabling one small timestep-conditioned latent
+CNN. Its inclusive normalized timestep ranges use `0 = low noise / reverse late` and
+`1 = high noise / reverse early`. No range is inferred automatically.
+
+Train the All-range variant with the existing training entry point:
+
+```bash
+accelerate launch --multi_gpu --num_processes 4 src/train_lora_upscaler.py \
+  --config configs/stage1_synthetic_latent_phi.yaml
+```
+
+Enabled checkpoints additionally contain `latent_phi.safetensors` and
+`latent_phi_config.json`; the existing `optimizer.pt` includes the phi parameter-group state.
+Configs without `phi_enabled: true` retain the original checkpoint contents and training path.
+
+Run the same trained checkpoint with an explicit inference-only hard range:
+
+```bash
+python src/infer_stage1_latent_phi.py \
+  --config configs/stage1_synthetic_latent_phi.yaml \
+  --checkpoint outputs/stage1_synthetic_latent_phi/final \
+  --output_dir outputs/phi_infer_all_to_late_02 \
+  --phi_timestep_range 0.0 0.2 --phi_weight 1.0
+```
+
+The optional z0 diagnostic accepts the same checkpoint without changing its baseline behavior
+when `--phi_path` is omitted:
+
+```bash
+python scripts/analyze_z0_reliability.py \
+  --config configs/stage1_synthetic_latent_phi.yaml \
+  --checkpoint outputs/stage1_synthetic_latent_phi/final \
+  --phi_path outputs/stage1_synthetic_latent_phi/final \
+  --phi_timestep_range 0.0 0.2 --phi_weight 1.0 \
+  --num_samples 1 --timestep_stride 100 --skip_lpips
+```
