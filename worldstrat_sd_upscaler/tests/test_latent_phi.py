@@ -15,6 +15,23 @@ from src.diffusion_prediction import (
 from src.latent_phi import LatentPhi, compute_phi_training_losses
 
 
+def test_tracker_config_serializes_timestep_ranges() -> None:
+    from src.utils import tracker_safe_config
+
+    original = {
+        "phi_enabled": True,
+        "phi_train_timestep_range": [0.0, 0.2],
+        "nested": {"range": [0.0, 1.0]},
+        "none_value": None,
+    }
+    converted = tracker_safe_config(original)
+    assert converted["phi_enabled"] is True
+    assert converted["phi_train_timestep_range"] == "[0.0, 0.2]"
+    assert converted["nested"] == '{"range": [0.0, 1.0]}'
+    assert converted["none_value"] == "null"
+    assert original["phi_train_timestep_range"] == [0.0, 0.2]
+
+
 def _diffusion_values(alpha_value: float = 0.37):
     torch.manual_seed(11)
     z0 = torch.randn(2, 4, 5, 6)

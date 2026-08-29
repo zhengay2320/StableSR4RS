@@ -49,6 +49,7 @@ from src.utils import (
     save_json,
     save_yaml,
     tensor_to_pil,
+    tracker_safe_config,
     worker_init_fn,
 )
 
@@ -547,7 +548,9 @@ def main() -> None:
         torch.set_rng_state(trainer_state["torch_rng_state"])
         LOGGER.info("Resumed optimizer/scheduler at global step %d from %s", global_step, resume_path)
 
-    accelerator.init_trackers("worldstrat_sd_upscaler", config=config)
+    accelerator.init_trackers(
+        "worldstrat_sd_upscaler", config=tracker_safe_config(config)
+    )
     noise_scheduler = pipe.scheduler
     low_res_scheduler = pipe.low_res_scheduler
     num_epochs = math.ceil(max_steps * int(config.get("gradient_accumulation_steps", 1)) / max(1, len(train_dataloader)))

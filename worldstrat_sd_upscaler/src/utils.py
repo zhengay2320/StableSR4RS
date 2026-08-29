@@ -18,6 +18,19 @@ from PIL import Image
 
 LOGGER = logging.getLogger(__name__)
 
+
+def tracker_safe_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Convert composite YAML values to TensorBoard hparam-compatible strings."""
+    result: dict[str, Any] = {}
+    for key, value in config.items():
+        if isinstance(value, (bool, int, float, str, torch.Tensor)):
+            result[key] = value
+        elif value is None:
+            result[key] = "null"
+        else:
+            result[key] = json.dumps(value, sort_keys=True, default=str)
+    return result
+
 FIXED_PROMPT = (
     "a high-resolution overhead satellite image with accurate geographic structures, "
     "natural colors, clear buildings, roads, vegetation, farmland and terrain"
