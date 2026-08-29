@@ -4,9 +4,7 @@ import torch
 import pytest
 from torch import nn
 
-from scripts.analyze_z0_reliability import optional_phi_prediction
 from src.diffusion_prediction import (
-    mix_x0_and_convert_model_output,
     model_output_to_x0,
     normalized_timesteps,
     timestep_range_mask,
@@ -101,15 +99,21 @@ class _CountingPhi(LatentPhi):
         super().__init__(latent_channels=4, hidden_channels=8, time_embed_dim=8, num_blocks=1)
         self.calls = 0
 
-    def forward(self, predicted_z0: torch.Tensor, normalized_t: torch.Tensor) -> torch.Tensor:
+    def forward(self, predicted_z0: torch.Tensor, normalized_t: torch.Tensor):
         self.calls += 1
         return super().forward(predicted_z0, normalized_t)
+
+
+class _Scheduler:
+    alphas_cumprod = torch.tensor([0.99, 0.92, 0.81, 0.65, 0.42])
 
 
 def _loss_inputs():
     torch.manual_seed(19)
     return {
         "target_z0": torch.randn(2, 4, 4, 4),
+        "sample_zt": torch.randn(2, 4, 4, 4),
+        "timesteps": torch.tensor([1, 3]),
         "normalized_t": torch.tensor([0.1, 0.8]),
         "target_rgb_minus_one_one": torch.rand(2, 3, 4, 4) * 2 - 1,
     }
@@ -123,9 +127,13 @@ def test_phi_loss_does_not_backpropagate_to_upstream_theta_or_adapter() -> None:
     predicted = theta * source + adapter * source.square()
     phi = _CountingPhi()
     result = compute_phi_training_losses(
-        phi, predicted, inputs["target_z0"], inputs["normalized_t"],
-        inputs["target_rgb_minus_one_one"], _CountingVAE(), None,
-        [0.0, 1.0], 1.0, 1.0, 0.0, 1.0,
+        phi=phi, predicted_z0=predicted, target_z0=inputs["target_z0"],
+        normalized_t=inputs["normalized_t"],
+        target_rgb_minus_one_one=inputs["target_rgb_minus_one_one"],
+        sample_zt=inputs["sample_zt"], timesteps=inputs["timesteps"],
+        scheduler=_Scheduler(), vae=_CountingVAE(), lpips_model=None,
+        timestep_range=[0.0, 1.0], lambda_z0=1.0, lambda_mu=1.0,
+        lambda_lpips=0.0, scaling_factor=1.0,
     )
     result["loss"].backward()
     assert theta.grad is None
@@ -139,9 +147,13 @@ def test_decoded_lpips_loss_backpropagates_only_to_phi_and_not_vae() -> None:
     vae = _CountingVAE()
     predicted = torch.randn(2, 4, 4, 4, requires_grad=True)
     result = compute_phi_training_losses(
-        phi, predicted, inputs["target_z0"], inputs["normalized_t"],
-        inputs["target_rgb_minus_one_one"], vae, _DifferentiableLPIPS(),
-        [0.0, 1.0], 1.0, 0.0, 1.0, 1.0,
+        phi=phi, predicted_z0=predicted, target_z0=inputs["target_z0"],
+        normalized_t=inputs["normalized_t"],
+        target_rgb_minus_one_one=inputs["target_rgb_minus_one_one"],
+        sample_zt=inputs["sample_zt"], timesteps=inputs["timesteps"],
+        scheduler=_Scheduler(), vae=vae, lpips_model=_DifferentiableLPIPS(),
+        timestep_range=[0.0, 1.0], lambda_z0=0.0, lambda_mu=0.0,
+        lambda_lpips=1.0, scaling_factor=1.0,
     )
     result["loss"].backward()
     assert vae.decode_calls == 1
@@ -155,25 +167,17 @@ def test_inactive_phi_skips_phi_vae_and_lpips() -> None:
     phi = _CountingPhi()
     vae = _CountingVAE()
     result = compute_phi_training_losses(
-        phi, torch.randn(2, 4, 4, 4), inputs["target_z0"],
-        torch.tensor([0.8, 0.9]), inputs["target_rgb_minus_one_one"],
-        vae, _DifferentiableLPIPS(), [0.0, 0.2], 1.0, 1.0, 1.0, 1.0,
+        phi=phi, predicted_z0=torch.randn(2, 4, 4, 4),
+        target_z0=inputs["target_z0"], normalized_t=torch.tensor([0.8, 0.9]),
+        target_rgb_minus_one_one=inputs["target_rgb_minus_one_one"],
+        sample_zt=inputs["sample_zt"], timesteps=inputs["timesteps"],
+        scheduler=_Scheduler(), vae=vae, lpips_model=_DifferentiableLPIPS(),
+        timestep_range=[0.0, 0.2], lambda_z0=1.0, lambda_mu=1.0,
+        lambda_lpips=1.0, scaling_factor=1.0,
     )
     assert result["loss"].item() == 0.0
     assert phi.calls == 0
     assert vae.decode_calls == 0
-
-
-def test_phi_weight_zero_keeps_base_output_and_skips_phi() -> None:
-    z0, noise, alpha, zt, _ = _diffusion_values()
-    phi = _CountingPhi()
-    phi_z0, mixed, active = optional_phi_prediction(
-        phi, z0, torch.tensor([0.1, 0.1]), (0.0, 1.0), 0.0
-    )
-    assert phi_z0 is None and not active and phi.calls == 0
-    assert torch.equal(mixed, z0)
-    _, converted = mix_x0_and_convert_model_output(z0, torch.randn_like(z0), 0.0, zt, alpha, "epsilon")
-    assert torch.allclose(converted, noise, atol=2e-6, rtol=2e-6)
 
 
 def test_latent_phi_save_load_round_trip(tmp_path) -> None:
@@ -188,4 +192,6 @@ def test_latent_phi_save_load_round_trip(tmp_path) -> None:
     assert weights.name == "latent_phi.safetensors"
     assert config.name == "latent_phi_config.json"
     assert restored.config == phi.config
-    assert torch.allclose(restored(sample, timesteps), expected)
+    actual = restored(sample, timesteps)
+    assert torch.allclose(actual.predicted_z0, expected.predicted_z0)
+    assert torch.allclose(actual.mixing_weight, expected.mixing_weight)

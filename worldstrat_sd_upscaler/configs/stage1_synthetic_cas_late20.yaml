@@ -3,7 +3,7 @@ data_root: /data/zhengay/EDiffSR-main/data/EDiffSR_worldstrat_rgb_x4_per_image
 train_lr_subdir: LR_bicubic
 val_lr_subdir: LR_bicubic
 gt_subdir: GT_geo_rad_visual
-output_dir: outputs/stage1_synthetic_latent_phi
+output_dir: outputs/stage1_synthetic_cas_late20
 gt_crop_size: 512
 scale: 4
 train_batch_size: 1
@@ -40,13 +40,12 @@ lr_scheduler: constant
 lr_warmup_steps: 0
 max_grad_norm: 1.0
 
-# Minimal Stage-1-only latent Cas-DM ablation. Ranges are inclusive normalized
-# training timesteps: 0 is low noise / reverse late, 1 is high noise / reverse early.
+# Complete latent Cas-DM is active only for t/(T-1) <= 0.2.
 phi_enabled: true
-phi_train_timestep_range: [0.0, 1.0]
-phi_infer_timestep_range: [0.0, 1.0]
-phi_weight: 1.0
+phi_train_timestep_range: [0.0, 0.2]
+phi_infer_timestep_range: [0.0, 0.2]
 lambda_z0: 1.0
+lambda_mu: 1.0
 lambda_lpips: 0.1
 phi_learning_rate: 1.0e-4
 phi_hidden_channels: 64

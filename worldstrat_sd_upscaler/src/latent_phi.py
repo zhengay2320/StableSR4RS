@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,11 +12,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from src.diffusion_prediction import timestep_range_mask
+from src.diffusion_prediction import posterior_mean_from_x0, timestep_range_mask
 
 
 PHI_WEIGHTS_NAME = "latent_phi.safetensors"
 PHI_CONFIG_NAME = "latent_phi_config.json"
+
+
+@dataclass(frozen=True)
+class PhiOutput:
+    predicted_z0: torch.Tensor
+    mixing_weight: torch.Tensor
+    mixing_logits: torch.Tensor
 
 
 def sinusoidal_timestep_embedding(normalized_t: torch.Tensor, dimension: int) -> torch.Tensor:
@@ -55,7 +63,7 @@ class PhiBlock(nn.Module):
 
 
 class LatentPhi(nn.Module):
-    """Small same-resolution CNN mapping predicted z0 to supervised z0."""
+    """Same-resolution CNN producing refined z0 and learned spatial r_t."""
 
     def __init__(
         self,
@@ -63,15 +71,22 @@ class LatentPhi(nn.Module):
         hidden_channels: int = 64,
         time_embed_dim: int = 128,
         num_blocks: int = 3,
+        outputs_mixing_weight: bool = True,
     ) -> None:
         super().__init__()
         if min(latent_channels, hidden_channels, time_embed_dim, num_blocks) <= 0:
             raise ValueError("All LatentPhi dimensions must be positive")
+        if not outputs_mixing_weight:
+            raise ValueError(
+                "Legacy LatentPhi checkpoints without learned r_t are incompatible "
+                "with the complete latent Cas-DM implementation"
+            )
         self.config = {
             "latent_channels": int(latent_channels),
             "hidden_channels": int(hidden_channels),
             "time_embed_dim": int(time_embed_dim),
             "num_blocks": int(num_blocks),
+            "outputs_mixing_weight": True,
         }
         self.time_mlp = nn.Sequential(
             nn.Linear(time_embed_dim, time_embed_dim),
@@ -83,10 +98,11 @@ class LatentPhi(nn.Module):
             PhiBlock(hidden_channels, time_embed_dim) for _ in range(num_blocks)
         )
         self.output_norm = nn.GroupNorm(min(8, hidden_channels), hidden_channels)
-        self.output_conv = nn.Conv2d(hidden_channels, latent_channels, 3, padding=1)
+        self.z0_head = nn.Conv2d(hidden_channels, latent_channels, 3, padding=1)
+        self.mixing_head = nn.Conv2d(hidden_channels, 1, 3, padding=1)
         self.activation = nn.SiLU()
 
-    def forward(self, predicted_z0: torch.Tensor, normalized_t: torch.Tensor) -> torch.Tensor:
+    def forward(self, predicted_z0: torch.Tensor, normalized_t: torch.Tensor) -> PhiOutput:
         if predicted_z0.ndim != 4 or predicted_z0.shape[1] != self.config["latent_channels"]:
             raise ValueError(
                 f"Expected BCHW with {self.config['latent_channels']} latent channels, "
@@ -101,7 +117,14 @@ class LatentPhi(nn.Module):
         features = self.input_conv(predicted_z0.float())
         for block in self.blocks:
             features = block(features, time_embedding)
-        return self.output_conv(self.activation(self.output_norm(features)))
+        features = self.activation(self.output_norm(features))
+        predicted_clean = self.z0_head(features)
+        mixing_logits = self.mixing_head(features)
+        return PhiOutput(
+            predicted_z0=predicted_clean,
+            mixing_weight=mixing_logits.sigmoid(),
+            mixing_logits=mixing_logits,
+        )
 
     def save_pretrained(self, directory: str | Path) -> tuple[Path, Path]:
         from safetensors.torch import save_file
@@ -130,8 +153,19 @@ class LatentPhi(nn.Module):
                 f"LatentPhi requires {weights_path} and {config_path}"
             )
         config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config.get("outputs_mixing_weight") is not True:
+            raise ValueError(
+                f"{config_path} describes a legacy LatentPhi without learned r_t; "
+                "retrain it with the complete latent Cas-DM architecture"
+            )
         model = cls(**config)
-        model.load_state_dict(load_file(str(weights_path), device=str(device)), strict=True)
+        try:
+            model.load_state_dict(load_file(str(weights_path), device=str(device)), strict=True)
+        except RuntimeError as error:
+            raise RuntimeError(
+                "LatentPhi checkpoint is incompatible with the learned-r_t architecture "
+                f"(expected both z0_head and mixing_head): {error}"
+            ) from error
         return model.to(device)
 
 
@@ -141,30 +175,37 @@ def compute_phi_training_losses(
     target_z0: torch.Tensor,
     normalized_t: torch.Tensor,
     target_rgb_minus_one_one: torch.Tensor,
+    sample_zt: torch.Tensor,
+    timesteps: torch.Tensor,
+    scheduler: Any,
     vae: nn.Module,
     lpips_model: nn.Module | None,
     timestep_range: list[float] | tuple[float, float],
-    phi_weight: float,
     lambda_z0: float,
+    lambda_mu: float,
     lambda_lpips: float,
     scaling_factor: float,
 ) -> dict[str, torch.Tensor]:
-    """Compute only the requested hard-range φ losses with θ detached."""
+    """Compute active-sample Cas-DM losses with the prescribed gradient paths."""
     batch_size = predicted_z0.shape[0]
     active = timestep_range_mask(normalized_t, timestep_range)
-    if float(phi_weight) == 0.0:
-        active = torch.zeros_like(active)
     active_count = active.sum()
     zero = predicted_z0.new_zeros((), dtype=torch.float32)
     result = {
         "loss": zero,
         "z0_loss": zero,
+        "mu_loss": zero,
         "lpips_loss": zero,
         "active_count": active_count.float(),
         "active_fraction": active.float().mean(),
-        "weight_mean": active.float().mean() * float(phi_weight),
-        "base_z0_abs_mean": predicted_z0.detach().float().abs().mean(),
-        "phi_z0_abs_mean": zero,
+        "r_mean": zero,
+        "r_std": zero,
+        "r_min": zero,
+        "r_max": zero,
+        "mu_base_abs_mean": zero,
+        "mu_phi_abs_mean": zero,
+        "mu_target_abs_mean": zero,
+        "mu_mixed_abs_mean": zero,
     }
     if not bool(active.any().item()):
         return result
@@ -172,7 +213,9 @@ def compute_phi_training_losses(
     base_active = predicted_z0.detach().float()[active]
     target_active = target_z0.detach().float()[active]
     normalized_active = normalized_t.float()[active]
-    phi_z0 = phi(base_active, normalized_active)
+    phi_output = phi(base_active, normalized_active)
+    phi_z0 = phi_output.predicted_z0
+    r_t = phi_output.mixing_weight
     z0_per_sample = F.mse_loss(phi_z0.float(), target_active, reduction="none").mean(
         dim=tuple(range(1, phi_z0.ndim))
     )
@@ -188,17 +231,45 @@ def compute_phi_training_losses(
     else:
         lpips_values = torch.zeros_like(z0_per_sample)
 
+    mu_target = posterior_mean_from_x0(
+        sample_zt.float()[active], target_active, timesteps[active], scheduler
+    ).detach()
+    mu_base = posterior_mean_from_x0(
+        sample_zt.float()[active], base_active, timesteps[active], scheduler
+    ).detach()
+    mu_phi = posterior_mean_from_x0(
+        sample_zt.float()[active], phi_z0, timesteps[active], scheduler
+    )
+    # L_mu trains only learned r_t (and the shared features feeding its head).
+    # Both reverse-mean branches are explicitly stop-gradient.
+    mu_mixed = r_t * mu_phi.detach() + (1.0 - r_t) * mu_base.detach()
+    mu_per_sample = F.mse_loss(mu_mixed, mu_target, reduction="none").mean(
+        dim=tuple(range(1, mu_mixed.ndim))
+    )
+
     # Inactive samples are mathematically zero-weighted. Dividing by the full
     # batch preserves the requested per-sample timestep_weight definition.
-    auxiliary = float(phi_weight) * (
-        float(lambda_z0) * z0_per_sample + float(lambda_lpips) * lpips_values
-    )
+    auxiliary = torch.zeros_like(z0_per_sample)
+    if float(lambda_z0) != 0.0:
+        auxiliary = auxiliary + float(lambda_z0) * z0_per_sample
+    if float(lambda_mu) != 0.0:
+        auxiliary = auxiliary + float(lambda_mu) * mu_per_sample
+    if float(lambda_lpips) != 0.0:
+        auxiliary = auxiliary + float(lambda_lpips) * lpips_values
     result.update(
         {
             "loss": auxiliary.sum() / batch_size,
             "z0_loss": z0_per_sample.mean(),
+            "mu_loss": mu_per_sample.mean(),
             "lpips_loss": lpips_values.mean(),
-            "phi_z0_abs_mean": phi_z0.float().abs().mean(),
+            "r_mean": r_t.detach().float().mean(),
+            "r_std": r_t.detach().float().std(unbiased=False),
+            "r_min": r_t.detach().float().min(),
+            "r_max": r_t.detach().float().max(),
+            "mu_base_abs_mean": mu_base.abs().mean(),
+            "mu_phi_abs_mean": mu_phi.detach().abs().mean(),
+            "mu_target_abs_mean": mu_target.abs().mean(),
+            "mu_mixed_abs_mean": mu_mixed.detach().abs().mean(),
         }
     )
     return result

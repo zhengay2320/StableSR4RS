@@ -205,6 +205,24 @@ contain mean, median, population standard deviation, P5, and P95. If LPIPS is un
 evaluator logs a clear installation hint and writes the other metrics; `--skip_lpips` disables it
 explicitly.
 
+### Untouched base-model benchmark on both test conditions
+
+`scripts/evaluate_unfinetuned_base.py` is a self-contained inference-and-evaluation benchmark for
+the original pretrained Stable Diffusion x4 Upscaler. It deliberately loads no project LoRA,
+ConditionAdapter, or latent phi. The model is loaded once and then evaluated on every valid pair
+from both `test/LR_bicubic` (synthetic) and `test/LR` (real), against
+`test/GT_geo_rad_visual`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/evaluate_unfinetuned_base.py
+```
+
+The model/data/output paths and inference settings are fixed constants at the top of the script.
+Each condition receives `sr_raw/`, optional previews, per-image metrics, and summary CSV/JSON;
+`outputs/unfinetuned_base_benchmark/summary_comparison.csv` contains the side-by-side means. The
+script performs generation and scoring in the same loop, so no separate inference or evaluator
+command is needed.
+
 ## 10. Resume a checkpoint
 
 Resume restores LoRA, ConditionAdapter, optimizer, LR scheduler, step, and PyTorch RNG state:
@@ -311,42 +329,82 @@ used only after prediction as a visual/metric reference. To disable the HR-deriv
 probe and run only this pure-noise path, add `--skip_training_timestep_analysis`; control the
 trajectory length with `--num_inference_steps` (default: the validation setting in the YAML).
 
-## Stage 1 latent-phi timestep ablation
+## Stage 1 learned-r_t latent Cas-DM timestep ablation
 
-`configs/stage1_synthetic_latent_phi.yaml` keeps the Stage 1 data, seed, LoRA, optimizer, steps,
-prompts, and validation settings unchanged while enabling one small timestep-conditioned latent
-CNN. Its inclusive normalized timestep ranges use `0 = low noise / reverse late` and
-`1 = high noise / reverse early`. No range is inferred automatically.
+The two Cas-DM configurations keep Stage 1 data, seed, optimization, prompts, and validation
+settings identical. The latent CNN predicts both a refined clean latent and a single-channel
+spatial `r_t`. Training uses clean-latent MSE, differentiable decoded LPIPS, and the paper's
+stop-gradient reverse-mean mixture loss `L_mu`. The inclusive ranges use
+`0 = low noise / reverse late` and `1 = high noise / reverse early`; no range is learned.
 
-Train the All-range variant with the existing training entry point:
+Baseline, Cas-All, and Cas-Late20 training commands are:
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 src/train_lora_upscaler.py \
-  --config configs/stage1_synthetic_latent_phi.yaml
+accelerate launch src/train_lora_upscaler.py --config configs/stage1_synthetic.yaml
+accelerate launch src/train_lora_upscaler.py --config configs/stage1_synthetic_cas_all.yaml
+accelerate launch src/train_lora_upscaler.py --config configs/stage1_synthetic_cas_late20.yaml
 ```
 
 Enabled checkpoints additionally contain `latent_phi.safetensors` and
 `latent_phi_config.json`; the existing `optimizer.pt` includes the phi parameter-group state.
 Configs without `phi_enabled: true` retain the original checkpoint contents and training path.
 
-Run the same trained checkpoint with an explicit inference-only hard range:
+Run each complete Cas-DM checkpoint with its matching range:
 
 ```bash
 python src/infer_stage1_latent_phi.py \
-  --config configs/stage1_synthetic_latent_phi.yaml \
-  --checkpoint outputs/stage1_synthetic_latent_phi/final \
-  --output_dir outputs/phi_infer_all_to_late_02 \
-  --phi_timestep_range 0.0 0.2 --phi_weight 1.0
+  --config configs/stage1_synthetic_cas_all.yaml \
+  --checkpoint outputs/stage1_synthetic_cas_all/final \
+  --output_dir outputs/cas_all_test
+
+python src/infer_stage1_latent_phi.py \
+  --config configs/stage1_synthetic_cas_late20.yaml \
+  --checkpoint outputs/stage1_synthetic_cas_late20/final \
+  --output_dir outputs/cas_late20_test
 ```
+
+This independent Cas-DM inference entry defaults to the complete `test` split and does not impose
+a sample limit. `--limit N` (or the legacy alias `--num_samples N`) is only for debugging. Use
+`--split val` explicitly for validation. Results preserve the original filenames under `sr_raw/`,
+`gt/`, and `lr_input/`, so the common evaluator can process every pair directly:
+
+```bash
+python src/evaluate.py \
+  --sr_dir outputs/cas_all_test/sr_raw \
+  --gt_dir outputs/cas_all_test/gt \
+  --lr_dir outputs/cas_all_test/lr_input \
+  --output_dir outputs/evaluation_cas_all_test
+
+python src/evaluate.py \
+  --sr_dir outputs/cas_late20_test/sr_raw \
+  --gt_dir outputs/cas_late20_test/gt \
+  --lr_dir outputs/cas_late20_test/lr_input \
+  --output_dir outputs/evaluation_cas_late20_test
+```
+
+For a baseline generated with the identical test loader, seed, DDIM steps, and noise level, use
+the same independent entry with `--disable_phi`:
+
+```bash
+python src/infer_stage1_latent_phi.py \
+  --config configs/stage1_synthetic.yaml \
+  --checkpoint outputs/stage1_synthetic/final \
+  --disable_phi \
+  --output_dir outputs/baseline_stage1_test
+```
+
+At an active DDIM timestep (`eta=0`), base and refined model outputs are stepped independently
+from the same current latent and their two `prev_sample` means are mixed by learned spatial
+`r_t`. At an inactive timestep, the script makes exactly one unchanged baseline scheduler step.
 
 The optional z0 diagnostic accepts the same checkpoint without changing its baseline behavior
 when `--phi_path` is omitted:
 
 ```bash
 python scripts/analyze_z0_reliability.py \
-  --config configs/stage1_synthetic_latent_phi.yaml \
-  --checkpoint outputs/stage1_synthetic_latent_phi/final \
-  --phi_path outputs/stage1_synthetic_latent_phi/final \
-  --phi_timestep_range 0.0 0.2 --phi_weight 1.0 \
+  --config configs/stage1_synthetic_cas_late20.yaml \
+  --checkpoint outputs/stage1_synthetic_cas_late20/final \
+  --phi_path outputs/stage1_synthetic_cas_late20/final \
+  --phi_timestep_range 0.0 0.2 \
   --num_samples 1 --timestep_stride 100 --skip_lpips
 ```

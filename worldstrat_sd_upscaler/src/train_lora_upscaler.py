@@ -382,10 +382,15 @@ def main() -> None:
             config.get("phi_infer_timestep_range", [0.0, 1.0]),
             "phi_infer_timestep_range",
         )
-        if not 0.0 <= float(config.get("phi_weight", 1.0)) <= 1.0:
-            raise ValueError("phi_weight must be in [0,1] for the fixed convex mixture")
-        if float(config.get("lambda_z0", 1.0)) < 0 or float(config.get("lambda_lpips", 0.1)) < 0:
-            raise ValueError("lambda_z0 and lambda_lpips must be non-negative")
+        if any(
+            float(config.get(name, default)) < 0
+            for name, default in (
+                ("lambda_z0", 1.0),
+                ("lambda_mu", 1.0),
+                ("lambda_lpips", 0.1),
+            )
+        ):
+            raise ValueError("lambda_z0, lambda_mu, and lambda_lpips must be non-negative")
 
     accelerator_options: dict[str, Any] = {}
     if phi_enabled:
@@ -559,10 +564,17 @@ def main() -> None:
     accumulation_active_count = 0.0
     accumulation_sample_count = 0.0
     accumulation_phi_z0_sum = 0.0
+    accumulation_phi_mu_sum = 0.0
     accumulation_phi_lpips_sum = 0.0
     accumulation_phi_total_sum = 0.0
-    accumulation_base_abs_sum = 0.0
-    accumulation_phi_abs_sum = 0.0
+    accumulation_r_mean_sum = 0.0
+    accumulation_r_std_sum = 0.0
+    accumulation_r_min = float("inf")
+    accumulation_r_max = float("-inf")
+    accumulation_mu_base_sum = 0.0
+    accumulation_mu_phi_sum = 0.0
+    accumulation_mu_target_sum = 0.0
+    accumulation_mu_mixed_sum = 0.0
     unet.train()
     adapter.train()
     if phi is not None:
@@ -644,12 +656,18 @@ def main() -> None:
                 phi_results = {
                     "loss": zero,
                     "z0_loss": zero,
+                    "mu_loss": zero,
                     "lpips_loss": zero,
                     "active_count": zero,
                     "active_fraction": zero,
-                    "weight_mean": zero,
-                    "base_z0_abs_mean": zero,
-                    "phi_z0_abs_mean": zero,
+                    "r_mean": zero,
+                    "r_std": zero,
+                    "r_min": zero,
+                    "r_max": zero,
+                    "mu_base_abs_mean": zero,
+                    "mu_phi_abs_mean": zero,
+                    "mu_target_abs_mean": zero,
+                    "mu_mixed_abs_mean": zero,
                 }
                 if phi is not None:
                     alpha_bar = alpha_bar_for_timesteps(noise_scheduler, timesteps)
@@ -665,11 +683,14 @@ def main() -> None:
                         target_z0=latents,
                         normalized_t=normalized_t,
                         target_rgb_minus_one_one=gt,
+                        sample_zt=noisy_latents,
+                        timesteps=timesteps,
+                        scheduler=noise_scheduler,
                         vae=pipe.vae,
                         lpips_model=differentiable_lpips,
                         timestep_range=config.get("phi_train_timestep_range", [0.0, 1.0]),
-                        phi_weight=float(config.get("phi_weight", 1.0)),
                         lambda_z0=float(config.get("lambda_z0", 1.0)),
+                        lambda_mu=float(config.get("lambda_mu", 1.0)),
                         lambda_lpips=float(config.get("lambda_lpips", 0.1)),
                         scaling_factor=float(pipe.vae.config.scaling_factor),
                     )
@@ -680,10 +701,18 @@ def main() -> None:
                     accumulation_active_count += micro_active
                     accumulation_sample_count += micro_batch
                     accumulation_phi_z0_sum += float(phi_results["z0_loss"].detach().item()) * micro_active
+                    accumulation_phi_mu_sum += float(phi_results["mu_loss"].detach().item()) * micro_active
                     accumulation_phi_lpips_sum += float(phi_results["lpips_loss"].detach().item()) * micro_active
                     accumulation_phi_total_sum += float(phi_results["loss"].detach().item()) * micro_batch
-                    accumulation_base_abs_sum += float(phi_results["base_z0_abs_mean"].detach().item()) * micro_batch
-                    accumulation_phi_abs_sum += float(phi_results["phi_z0_abs_mean"].detach().item()) * micro_active
+                    if micro_active > 0:
+                        accumulation_r_mean_sum += float(phi_results["r_mean"].detach().item()) * micro_active
+                        accumulation_r_std_sum += float(phi_results["r_std"].detach().item()) * micro_active
+                        accumulation_r_min = min(accumulation_r_min, float(phi_results["r_min"].detach().item()))
+                        accumulation_r_max = max(accumulation_r_max, float(phi_results["r_max"].detach().item()))
+                        accumulation_mu_base_sum += float(phi_results["mu_base_abs_mean"].detach().item()) * micro_active
+                        accumulation_mu_phi_sum += float(phi_results["mu_phi_abs_mean"].detach().item()) * micro_active
+                        accumulation_mu_target_sum += float(phi_results["mu_target_abs_mean"].detach().item()) * micro_active
+                        accumulation_mu_mixed_sum += float(phi_results["mu_mixed_abs_mean"].detach().item()) * micro_active
                 if not torch.isfinite(loss):
                     raise FloatingPointError(
                         "Non-finite training loss detected before backward. "
@@ -726,26 +755,45 @@ def main() -> None:
                             torch.tensor([value], device=latents.device)
                         ).sum()
 
+                    has_active = bool(gathered_count.item() > 0)
+                    local_r_min = accumulation_r_min if accumulation_active_count > 0 else float("inf")
+                    local_r_max = accumulation_r_max if accumulation_active_count > 0 else float("-inf")
+                    gathered_r_min = accelerator.gather(torch.tensor([local_r_min], device=latents.device)).min()
+                    gathered_r_max = accelerator.gather(torch.tensor([local_r_max], device=latents.device)).max()
+
                     logs.update(
                         {
                             "diffusion_loss": diffusion_value,
                             "phi_z0_loss": float((gathered_sum(accumulation_phi_z0_sum) / gathered_count.clamp_min(1)).item()),
+                            "phi_mu_loss": float((gathered_sum(accumulation_phi_mu_sum) / gathered_count.clamp_min(1)).item()),
                             "phi_lpips_loss": float((gathered_sum(accumulation_phi_lpips_sum) / gathered_count.clamp_min(1)).item()),
                             "phi_total_loss": float((gathered_sum(accumulation_phi_total_sum) / gathered_batch.clamp_min(1)).item()),
                             "phi_active_fraction": active_fraction,
                             "phi_active_count": float(gathered_count.item()),
-                            "phi_weight_mean": active_fraction * float(config.get("phi_weight", 1.0)),
-                            "base_z0_abs_mean": float((gathered_sum(accumulation_base_abs_sum) / gathered_batch.clamp_min(1)).item()),
-                            "phi_z0_abs_mean": float((gathered_sum(accumulation_phi_abs_sum) / gathered_count.clamp_min(1)).item()),
+                            "r_t_mean": float((gathered_sum(accumulation_r_mean_sum) / gathered_count.clamp_min(1)).item()),
+                            "r_t_std": float((gathered_sum(accumulation_r_std_sum) / gathered_count.clamp_min(1)).item()),
+                            "r_t_min": float(gathered_r_min.item()) if has_active else 0.0,
+                            "r_t_max": float(gathered_r_max.item()) if has_active else 0.0,
+                            "mu_base_abs_mean": float((gathered_sum(accumulation_mu_base_sum) / gathered_count.clamp_min(1)).item()),
+                            "mu_phi_abs_mean": float((gathered_sum(accumulation_mu_phi_sum) / gathered_count.clamp_min(1)).item()),
+                            "mu_target_abs_mean": float((gathered_sum(accumulation_mu_target_sum) / gathered_count.clamp_min(1)).item()),
+                            "mu_mixed_abs_mean": float((gathered_sum(accumulation_mu_mixed_sum) / gathered_count.clamp_min(1)).item()),
                         }
                     )
                     accumulation_active_count = 0.0
                     accumulation_sample_count = 0.0
                     accumulation_phi_z0_sum = 0.0
+                    accumulation_phi_mu_sum = 0.0
                     accumulation_phi_lpips_sum = 0.0
                     accumulation_phi_total_sum = 0.0
-                    accumulation_base_abs_sum = 0.0
-                    accumulation_phi_abs_sum = 0.0
+                    accumulation_r_mean_sum = 0.0
+                    accumulation_r_std_sum = 0.0
+                    accumulation_r_min = float("inf")
+                    accumulation_r_max = float("-inf")
+                    accumulation_mu_base_sum = 0.0
+                    accumulation_mu_phi_sum = 0.0
+                    accumulation_mu_target_sum = 0.0
+                    accumulation_mu_mixed_sum = 0.0
                 progress.set_postfix(loss=f"{loss_value:.4f}")
                 accelerator.log(logs, step=global_step)
 

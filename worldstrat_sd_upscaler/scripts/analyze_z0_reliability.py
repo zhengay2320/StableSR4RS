@@ -22,11 +22,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.diffusion_prediction import (
-    mix_x0_and_convert_model_output,
+    mix_reverse_means,
     model_output_to_x0,
     normalized_timesteps,
+    posterior_mean_from_x0,
     timestep_range_mask,
     validate_timestep_range,
+    x0_to_model_output,
 )
 from src.latent_phi import LatentPhi
 
@@ -65,9 +67,18 @@ METRIC_FIELDS = (
     "mixed_decoded_x0_ssim",
     "mixed_decoded_x0_lpips",
     "phi_z0_abs_mean",
-    "mixed_z0_abs_mean",
     "phi_active",
-    "phi_weight",
+    "r_t_mean",
+    "r_t_std",
+    "r_t_min",
+    "r_t_max",
+    "base_reverse_mean_abs_mean",
+    "phi_reverse_mean_abs_mean",
+    "mixed_reverse_mean_abs_mean",
+    "target_reverse_mean_abs_mean",
+    "base_reverse_mean_mse",
+    "phi_reverse_mean_mse",
+    "mixed_reverse_mean_mse",
 )
 REVERSE_METRIC_FIELDS = (
     "sample_id",
@@ -75,6 +86,7 @@ REVERSE_METRIC_FIELDS = (
     "inference_step",
     "inference_step_fraction",
     "timestep",
+    "normalized_timestep",
     "alpha_bar",
     "snr",
     "log_snr",
@@ -95,9 +107,14 @@ REVERSE_METRIC_FIELDS = (
     "mixed_decoded_x0_ssim",
     "mixed_decoded_x0_lpips",
     "phi_z0_abs_mean",
-    "mixed_z0_abs_mean",
     "phi_active",
-    "phi_weight",
+    "r_t_mean",
+    "r_t_std",
+    "r_t_min",
+    "r_t_max",
+    "base_reverse_mean_abs_mean",
+    "phi_reverse_mean_abs_mean",
+    "mixed_reverse_mean_abs_mean",
 )
 
 
@@ -134,7 +151,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip_lpips", action="store_true")
     parser.add_argument("--phi_path", type=Path, default=None)
     parser.add_argument("--phi_timestep_range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
-    parser.add_argument("--phi_weight", type=float, default=None)
     parser.add_argument("--save_all_timestep_images", action="store_true")
     parser.add_argument(
         "--error_display_max",
@@ -260,19 +276,15 @@ def optional_phi_prediction(
     base_z0: torch.Tensor,
     normalized_t: torch.Tensor,
     timestep_range: tuple[float, float],
-    weight: float,
-) -> tuple[torch.Tensor | None, torch.Tensor, bool]:
-    """Apply φ only inside the configured hard range and only for nonzero weight."""
+) -> tuple[Any | None, bool]:
+    """Apply learned-r_t φ only inside the configured hard timestep range."""
     active = (
         phi is not None
-        and weight != 0.0
         and bool(timestep_range_mask(normalized_t, timestep_range).all().item())
     )
     if not active:
-        return None, base_z0, False
-    phi_z0 = phi(base_z0.detach().float(), normalized_t.float())
-    mixed_z0 = (1.0 - weight) * base_z0.float() + weight * phi_z0.float()
-    return phi_z0, mixed_z0, True
+        return None, False
+    return phi(base_z0.detach().float(), normalized_t.float()), True
 
 
 def decoded_quality(
@@ -697,7 +709,6 @@ def analyze_sample(
     error_display_max: float,
     phi: LatentPhi | None,
     phi_timestep_range: tuple[float, float],
-    phi_weight: float,
 ) -> tuple[list[dict[str, Any]], list[Image.Image], float, dict[str, float]]:
     from src.metrics import psnr, ssim
     from src.train_lora_upscaler import encode_prompts
@@ -768,9 +779,18 @@ def analyze_sample(
         model_float = model_output.float()
         predicted_z0 = prediction_to_x0(model_float, zt_float, alpha_bar, prediction_type)
         normalized_t = normalized_timesteps(timestep, len(alphas))
-        phi_z0, mixed_z0, phi_active = optional_phi_prediction(
-            phi, predicted_z0, normalized_t, phi_timestep_range, phi_weight
+        phi_output, phi_active = optional_phi_prediction(
+            phi, predicted_z0, normalized_t, phi_timestep_range
         )
+        phi_z0 = phi_output.predicted_z0 if phi_output is not None else None
+        mu_target = posterior_mean_from_x0(zt_float, z0.float(), timestep, pipe.scheduler)
+        mu_base = posterior_mean_from_x0(zt_float, predicted_z0, timestep, pipe.scheduler)
+        if phi_output is not None:
+            mu_phi = posterior_mean_from_x0(zt_float, phi_z0, timestep, pipe.scheduler)
+            mu_mixed = mix_reverse_means(mu_base, mu_phi, phi_output.mixing_weight)
+        else:
+            mu_phi = None
+            mu_mixed = mu_base
         predicted_epsilon = prediction_to_epsilon(model_float, zt_float, alpha_bar, prediction_type)
         target = true_model_target(pipe.scheduler, z0.float(), epsilon.float(), timestep, prediction_type)
 
@@ -783,9 +803,6 @@ def analyze_sample(
         decoded_x0_raw = decode_latent_raw(pipe.vae, predicted_z0, scaling_factor)
         decoded_x0 = decoded_x0_raw.clamp(0.0, 1.0)
         phi_decoded = decode_latent(pipe.vae, phi_z0, scaling_factor) if phi_z0 is not None else None
-        mixed_decoded = (
-            decode_latent(pipe.vae, mixed_z0, scaling_factor) if phi_active else decoded_x0
-        )
         prediction_array = image_tensor_to_array(decoded_x0)
         target_array = image_tensor_to_array(hr_01)
         alpha_value = float(alpha_bar.item())
@@ -796,9 +813,6 @@ def analyze_sample(
             phi_psnr, phi_ssim, phi_lpips = decoded_quality(phi_decoded, hr_01, lpips_metric)
         else:
             phi_psnr, phi_ssim, phi_lpips = "", "", ""
-        mixed_psnr, mixed_ssim, mixed_lpips = decoded_quality(
-            mixed_decoded, hr_01, lpips_metric
-        )
         below_fraction = float((decoded_x0_raw < 0.0).float().mean().item())
         above_fraction = float((decoded_x0_raw > 1.0).float().mean().item())
         lr_reconstruction = F.interpolate(
@@ -833,13 +847,22 @@ def analyze_sample(
             "phi_decoded_x0_psnr": phi_psnr,
             "phi_decoded_x0_ssim": phi_ssim,
             "phi_decoded_x0_lpips": phi_lpips,
-            "mixed_decoded_x0_psnr": mixed_psnr,
-            "mixed_decoded_x0_ssim": mixed_ssim,
-            "mixed_decoded_x0_lpips": mixed_lpips,
+            "mixed_decoded_x0_psnr": "",
+            "mixed_decoded_x0_ssim": "",
+            "mixed_decoded_x0_lpips": "",
             "phi_z0_abs_mean": float(phi_z0.abs().mean().item()) if phi_z0 is not None else "",
-            "mixed_z0_abs_mean": float(mixed_z0.abs().mean().item()),
             "phi_active": int(phi_active),
-            "phi_weight": float(phi_weight) if phi_active else 0.0,
+            "r_t_mean": float(phi_output.mixing_weight.mean().item()) if phi_output is not None else "",
+            "r_t_std": float(phi_output.mixing_weight.std(unbiased=False).item()) if phi_output is not None else "",
+            "r_t_min": float(phi_output.mixing_weight.min().item()) if phi_output is not None else "",
+            "r_t_max": float(phi_output.mixing_weight.max().item()) if phi_output is not None else "",
+            "base_reverse_mean_abs_mean": float(mu_base.abs().mean().item()),
+            "phi_reverse_mean_abs_mean": float(mu_phi.abs().mean().item()) if mu_phi is not None else "",
+            "mixed_reverse_mean_abs_mean": float(mu_mixed.abs().mean().item()),
+            "target_reverse_mean_abs_mean": float(mu_target.abs().mean().item()),
+            "base_reverse_mean_mse": float(F.mse_loss(mu_base, mu_target).item()),
+            "phi_reverse_mean_mse": float(F.mse_loss(mu_phi, mu_target).item()) if mu_phi is not None else "",
+            "mixed_reverse_mean_mse": float(F.mse_loss(mu_mixed, mu_target).item()),
         }
         rows.append(row)
 
@@ -857,7 +880,7 @@ def analyze_sample(
                 decoded_x0,
                 error_display_max,
                 phi_decoded,
-                mixed_decoded if phi_active else None,
+                None,
             )
             sample_dir = output_dir / "per_timestep" / str(sample["sample_id"])
             sample_dir.mkdir(parents=True, exist_ok=True)
@@ -882,7 +905,6 @@ def analyze_pure_noise_trajectory(
     error_display_max: float,
     phi: LatentPhi | None,
     phi_timestep_range: tuple[float, float],
-    phi_weight: float,
     lpips_metric: Any | None,
 ) -> tuple[list[dict[str, Any]], list[Image.Image]]:
     """Run real reverse inference from pure noise, without constructing z_t from HR."""
@@ -932,7 +954,6 @@ def analyze_pure_noise_trajectory(
     prediction_type = str(pipe.scheduler.config.prediction_type)
     alphas = pipe.scheduler.alphas_cumprod.to(device=device, dtype=torch.float32)
     selected_steps = representative_inference_steps(len(scheduler_timesteps))
-    extra_step_kwargs = pipe.prepare_extra_step_kwargs(generator, eta=0.0)
     rows: list[dict[str, Any]] = []
     visuals: list[Image.Image] = []
 
@@ -953,30 +974,37 @@ def analyze_pure_noise_trajectory(
             model_output.float(), latent_before.float(), alpha_bar, prediction_type
         )
         normalized_t = normalized_timesteps(timestep.reshape(1).long(), len(alphas))
-        phi_z0, mixed_z0, phi_active = optional_phi_prediction(
-            phi, predicted_z0, normalized_t, phi_timestep_range, phi_weight
+        phi_output, phi_active = optional_phi_prediction(
+            phi, predicted_z0, normalized_t, phi_timestep_range
         )
-        step_model_output = model_output
+        phi_z0 = phi_output.predicted_z0 if phi_output is not None else None
+        base_previous = pipe.scheduler.step(
+            model_output, timestep, latent_before, eta=0.0, return_dict=True
+        ).prev_sample
         if phi_active:
-            _, converted_output = mix_x0_and_convert_model_output(
-                predicted_z0,
+            phi_model_output = x0_to_model_output(
                 phi_z0,
-                phi_weight,
                 latent_before,
                 alpha_bar,
                 prediction_type,
             )
-            step_model_output = converted_output.to(dtype=model_output.dtype)
-        latents = pipe.scheduler.step(
-            step_model_output, timestep, latent_before, **extra_step_kwargs, return_dict=False
-        )[0]
+            phi_previous = pipe.scheduler.step(
+                phi_model_output.to(dtype=model_output.dtype),
+                timestep,
+                latent_before,
+                eta=0.0,
+                return_dict=True,
+            ).prev_sample
+            latents = mix_reverse_means(
+                base_previous, phi_previous, phi_output.mixing_weight
+            ).to(dtype=dtype)
+        else:
+            phi_previous = None
+            latents = base_previous
 
         predicted_clean_raw = decode_latent_raw(pipe.vae, predicted_z0, scaling_factor)
         predicted_clean = predicted_clean_raw.clamp(0.0, 1.0)
         phi_decoded = decode_latent(pipe.vae, phi_z0, scaling_factor) if phi_z0 is not None else None
-        mixed_decoded = (
-            decode_latent(pipe.vae, mixed_z0, scaling_factor) if phi_active else predicted_clean
-        )
         predicted_array = image_tensor_to_array(predicted_clean)
         target_array = image_tensor_to_array(hr_01)
         alpha_value = float(alpha_bar.item())
@@ -990,15 +1018,13 @@ def analyze_pure_noise_trajectory(
             phi_psnr, phi_ssim, phi_lpips = decoded_quality(phi_decoded, hr_01, lpips_metric)
         else:
             phi_psnr, phi_ssim, phi_lpips = "", "", ""
-        mixed_psnr, mixed_ssim, mixed_lpips = decoded_quality(
-            mixed_decoded, hr_01, lpips_metric
-        )
         row: dict[str, Any] = {
             "sample_id": sample["sample_id"],
             "filename": sample["filename"],
             "inference_step": step_index,
             "inference_step_fraction": step_index / max(1, len(scheduler_timesteps) - 1),
             "timestep": timestep_value,
+            "normalized_timestep": timestep_value / max(1, len(alphas) - 1),
             "alpha_bar": alpha_value,
             "snr": snr_value,
             "log_snr": math.log(max(snr_value, 1e-30)),
@@ -1017,13 +1043,18 @@ def analyze_pure_noise_trajectory(
             "phi_decoded_x0_psnr": phi_psnr,
             "phi_decoded_x0_ssim": phi_ssim,
             "phi_decoded_x0_lpips": phi_lpips,
-            "mixed_decoded_x0_psnr": mixed_psnr,
-            "mixed_decoded_x0_ssim": mixed_ssim,
-            "mixed_decoded_x0_lpips": mixed_lpips,
+            "mixed_decoded_x0_psnr": "",
+            "mixed_decoded_x0_ssim": "",
+            "mixed_decoded_x0_lpips": "",
             "phi_z0_abs_mean": float(phi_z0.abs().mean().item()) if phi_z0 is not None else "",
-            "mixed_z0_abs_mean": float(mixed_z0.abs().mean().item()),
             "phi_active": int(phi_active),
-            "phi_weight": float(phi_weight) if phi_active else 0.0,
+            "r_t_mean": float(phi_output.mixing_weight.mean().item()) if phi_output is not None else "",
+            "r_t_std": float(phi_output.mixing_weight.std(unbiased=False).item()) if phi_output is not None else "",
+            "r_t_min": float(phi_output.mixing_weight.min().item()) if phi_output is not None else "",
+            "r_t_max": float(phi_output.mixing_weight.max().item()) if phi_output is not None else "",
+            "base_reverse_mean_abs_mean": float(base_previous.abs().mean().item()),
+            "phi_reverse_mean_abs_mean": float(phi_previous.abs().mean().item()) if phi_previous is not None else "",
+            "mixed_reverse_mean_abs_mean": float(latents.abs().mean().item()),
         }
         rows.append(row)
 
@@ -1044,7 +1075,7 @@ def analyze_pure_noise_trajectory(
                 next_decoded,
                 error_display_max,
                 phi_decoded,
-                mixed_decoded if phi_active else None,
+                None,
             )
             sample_dir = output_dir / "pure_noise_trajectory" / "per_step" / str(sample["sample_id"])
             sample_dir.mkdir(parents=True, exist_ok=True)
@@ -1097,15 +1128,17 @@ def main() -> None:
         phi_path = resolve_project_path(args.phi_path, PROJECT_ROOT)
         phi = LatentPhi.from_pretrained(phi_path, device=device).eval()
         phi.requires_grad_(False)
+        from diffusers import DDIMScheduler
+
+        if not isinstance(pipe.scheduler, DDIMScheduler):
+            raise TypeError(
+                "Learned-r_t trajectory analysis requires DDIMScheduler with eta=0, got "
+                f"{type(pipe.scheduler).__name__}"
+            )
     phi_timestep_range = validate_timestep_range(
         args.phi_timestep_range or config.get("phi_infer_timestep_range", [0.0, 1.0]),
         "phi_timestep_range",
     )
-    phi_weight = float(
-        args.phi_weight if args.phi_weight is not None else config.get("phi_weight", 1.0)
-    )
-    if not 0.0 <= phi_weight <= 1.0:
-        raise ValueError("--phi_weight must be in [0,1]")
     prediction_type = str(pipe.scheduler.config.prediction_type)
     total_timesteps = int(pipe.scheduler.config.num_train_timesteps)
     timesteps = evaluated_timesteps(total_timesteps, args.timestep_stride)
@@ -1159,7 +1192,6 @@ def main() -> None:
             "analysis_error_display_max": args.error_display_max,
             "analysis_phi_path": str(args.phi_path) if args.phi_path is not None else None,
             "analysis_phi_timestep_range": list(phi_timestep_range),
-            "analysis_phi_weight": phi_weight,
             "analysis_num_inference_steps": num_inference_steps,
             "analysis_skip_training_timestep_analysis": args.skip_training_timestep_analysis,
         }
@@ -1190,7 +1222,7 @@ def main() -> None:
                 sample, pipe, adapter, config, device, dtype, timesteps, selected_set,
                 args.noise_seed, args.vae_seed, low_res_noise_level, lpips_metric,
                 output_dir, args.save_all_timestep_images, args.error_display_max,
-                phi, phi_timestep_range, phi_weight,
+                phi, phi_timestep_range,
             )
             all_rows.extend(rows)
             oracle_errors[str(sample["sample_id"])] = oracle_error
@@ -1216,7 +1248,6 @@ def main() -> None:
             args.error_display_max,
             phi,
             phi_timestep_range,
-            phi_weight,
             lpips_metric,
         )
         all_reverse_rows.extend(reverse_rows)
@@ -1261,7 +1292,7 @@ def main() -> None:
             "enabled": phi is not None,
             "path": str(args.phi_path) if args.phi_path is not None else None,
             "timestep_range": list(phi_timestep_range),
-            "weight": phi_weight,
+            "mixing": "learned spatial r_t over base/phi reverse means",
         },
         "num_train_timesteps": total_timesteps,
         "evaluated_timestep_count": len(timesteps),

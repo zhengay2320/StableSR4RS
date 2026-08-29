@@ -90,18 +90,71 @@ def timestep_range_mask(normalized_t: torch.Tensor, value: Sequence[float]) -> t
     return (values >= lower) & (values <= upper)
 
 
-def mix_x0_and_convert_model_output(
-    base_x0: torch.Tensor,
-    phi_x0: torch.Tensor,
-    weight: float | torch.Tensor,
-    sample: torch.Tensor,
-    alpha_bar: torch.Tensor,
-    prediction_type: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the fixed Cas-DM-style mixture and return scheduler model output."""
-    weight_tensor = torch.as_tensor(weight, device=base_x0.device, dtype=torch.float32)
-    while weight_tensor.ndim < base_x0.ndim:
-        weight_tensor = weight_tensor.unsqueeze(-1)
-    mixed_x0 = (1.0 - weight_tensor) * base_x0.float() + weight_tensor * phi_x0.float()
-    converted = x0_to_model_output(mixed_x0, sample, alpha_bar, prediction_type)
-    return mixed_x0, converted
+def posterior_mean_from_x0(
+    sample_zt: torch.Tensor,
+    predicted_z0: torch.Tensor,
+    timesteps: torch.Tensor,
+    scheduler: Any,
+) -> torch.Tensor:
+    """Compute q(z_{t-1} | z_t, predicted_z0)'s mean in float32.
+
+    This is the adjacent training posterior used by L_mu. It is intentionally
+    separate from a DDIM inference step, which may jump over timesteps.
+    """
+    if sample_zt.shape != predicted_z0.shape:
+        raise ValueError(
+            "sample_zt and predicted_z0 must have identical shapes, got "
+            f"{tuple(sample_zt.shape)} and {tuple(predicted_z0.shape)}"
+        )
+    timestep_batch = timesteps.long().reshape(-1)
+    if timestep_batch.numel() != sample_zt.shape[0]:
+        raise ValueError("timesteps must contain one value per sample")
+
+    alphas_cumprod = scheduler.alphas_cumprod.to(
+        device=sample_zt.device, dtype=torch.float32
+    )
+    if bool((timestep_batch < 0).any()) or bool(
+        (timestep_batch >= alphas_cumprod.numel()).any()
+    ):
+        raise IndexError("timesteps contain an index outside scheduler.alphas_cumprod")
+
+    alpha_bar_t = alphas_cumprod[timestep_batch]
+    previous_indices = (timestep_batch - 1).clamp_min(0)
+    alpha_bar_previous = alphas_cumprod[previous_indices]
+    alpha_bar_previous = torch.where(
+        timestep_batch > 0,
+        alpha_bar_previous,
+        torch.ones_like(alpha_bar_previous),
+    )
+    alpha_t = alpha_bar_t / alpha_bar_previous
+    beta_t = 1.0 - alpha_t
+    denominator = (1.0 - alpha_bar_t).clamp_min(torch.finfo(torch.float32).eps)
+    coefficient_z0 = alpha_bar_previous.sqrt() * beta_t / denominator
+    coefficient_zt = (
+        alpha_t.clamp_min(0.0).sqrt()
+        * (1.0 - alpha_bar_previous)
+        / denominator
+    )
+    broadcast_shape = (-1,) + (1,) * (sample_zt.ndim - 1)
+    return (
+        coefficient_z0.reshape(broadcast_shape) * predicted_z0.float()
+        + coefficient_zt.reshape(broadcast_shape) * sample_zt.float()
+    )
+
+
+def mix_reverse_means(
+    base_mean: torch.Tensor,
+    phi_mean: torch.Tensor,
+    mixing_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Mix two reverse means using a learned single-channel spatial r_t."""
+    if base_mean.shape != phi_mean.shape:
+        raise ValueError("base_mean and phi_mean must have identical shapes")
+    if mixing_weight.ndim != base_mean.ndim:
+        raise ValueError("mixing_weight must have the same rank as the latent tensors")
+    if mixing_weight.shape[0] != base_mean.shape[0] or mixing_weight.shape[1] != 1:
+        raise ValueError("mixing_weight must have shape [B, 1, ...]")
+    if mixing_weight.shape[2:] != base_mean.shape[2:]:
+        raise ValueError("mixing_weight spatial dimensions must match the latent tensors")
+    r_t = mixing_weight.float()
+    return r_t * phi_mean.float() + (1.0 - r_t) * base_mean.float()
