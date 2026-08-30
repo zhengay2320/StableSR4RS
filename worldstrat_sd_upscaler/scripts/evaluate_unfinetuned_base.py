@@ -4,6 +4,7 @@
 This is deliberately standalone: it loads no project LoRA, ConditionAdapter,
 or latent phi, and performs inference plus metric computation in one pass.
 Edit only the constants below when moving the repository or data.
+直接测试原始的stablesr的结果
 """
 
 from __future__ import annotations

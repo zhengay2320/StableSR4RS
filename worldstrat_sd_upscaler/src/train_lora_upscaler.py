@@ -34,6 +34,7 @@ from src.diffusion_prediction import (
 )
 from src.latent_phi import LatentPhi, compute_phi_training_losses
 from src.metrics import psnr, ssim
+from src.rgb_auxiliary_loss import compute_rgb_auxiliary_losses
 from src.utils import (
     FIXED_PROMPT,
     atomic_torch_save,
@@ -373,6 +374,12 @@ def main() -> None:
     if int(config.get("low_res_noise_level_min", 0)) > int(config.get("low_res_noise_level_max", 20)):
         raise ValueError("low_res_noise_level_min must not exceed low_res_noise_level_max")
     phi_enabled = bool(config.get("phi_enabled", False))
+    rgb_aux_loss_enabled = bool(config.get("rgb_aux_loss_enabled", False))
+    if rgb_aux_loss_enabled and any(
+        float(config.get(name, default)) < 0
+        for name, default in (("lambda_l1", 0.1), ("lambda_lpips_rgb", 0.1))
+    ):
+        raise ValueError("lambda_l1 and lambda_lpips_rgb must be non-negative")
     if phi_enabled:
         validate_timestep_range(
             config.get("phi_train_timestep_range", [0.0, 1.0]),
@@ -466,15 +473,20 @@ def main() -> None:
                 time_embed_dim=int(config.get("phi_time_embed_dim", 128)),
                 num_blocks=int(config.get("phi_num_blocks", 3)),
             )
-        if float(config.get("lambda_lpips", 0.1)) > 0:
-            try:
-                import lpips  # type: ignore
-            except ImportError as error:
-                raise RuntimeError(
-                    "phi_enabled with lambda_lpips>0 requires the optional `lpips` package"
-                ) from error
-            differentiable_lpips = lpips.LPIPS(net="alex").eval()
-            differentiable_lpips.requires_grad_(False)
+    lpips_required = (
+        phi_enabled and float(config.get("lambda_lpips", 0.1)) > 0
+    ) or (
+        rgb_aux_loss_enabled and float(config.get("lambda_lpips_rgb", 0.1)) > 0
+    )
+    if lpips_required:
+        try:
+            import lpips  # type: ignore
+        except ImportError as error:
+            raise RuntimeError(
+                "Enabled differentiable LPIPS loss requires the `lpips` package"
+            ) from error
+        differentiable_lpips = lpips.LPIPS(net="alex").eval()
+        differentiable_lpips.requires_grad_(False)
 
     with accelerator.main_process_first():
         train_dataset, validation_dataset = build_datasets(
@@ -575,6 +587,10 @@ def main() -> None:
     accumulation_mu_phi_sum = 0.0
     accumulation_mu_target_sum = 0.0
     accumulation_mu_mixed_sum = 0.0
+    accumulation_rgb_sample_count = 0.0
+    accumulation_rgb_l1_sum = 0.0
+    accumulation_rgb_lpips_sum = 0.0
+    accumulation_rgb_total_sum = 0.0
     unet.train()
     adapter.train()
     if phi is not None:
@@ -669,6 +685,7 @@ def main() -> None:
                     "mu_target_abs_mean": zero,
                     "mu_mixed_abs_mean": zero,
                 }
+                base_z0: torch.Tensor | None = None
                 if phi is not None:
                     alpha_bar = alpha_bar_for_timesteps(noise_scheduler, timesteps)
                     base_z0 = model_output_to_x0(
@@ -694,7 +711,43 @@ def main() -> None:
                         lambda_lpips=float(config.get("lambda_lpips", 0.1)),
                         scaling_factor=float(pipe.vae.config.scaling_factor),
                     )
-                loss = diffusion_loss + phi_results["loss"]
+                predicted_z0_for_rgb: torch.Tensor | None = None
+                if rgb_aux_loss_enabled:
+                    if base_z0 is not None:
+                        predicted_z0_for_rgb = base_z0
+                    else:
+                        alpha_bar_rgb = alpha_bar_for_timesteps(
+                            noise_scheduler, timesteps
+                        )
+                        predicted_z0_for_rgb = model_output_to_x0(
+                            model_output,
+                            noisy_latents,
+                            alpha_bar_rgb,
+                            str(prediction_type),
+                        )
+                rgb_results = compute_rgb_auxiliary_losses(
+                    predicted_z0=predicted_z0_for_rgb,
+                    target_rgb_minus_one_one=gt,
+                    vae=pipe.vae,
+                    lpips_model=differentiable_lpips,
+                    enabled=rgb_aux_loss_enabled,
+                    lambda_l1=float(config.get("lambda_l1", 0.1)),
+                    lambda_lpips_rgb=float(config.get("lambda_lpips_rgb", 0.1)),
+                    scaling_factor=float(pipe.vae.config.scaling_factor),
+                )
+                loss = diffusion_loss + phi_results["loss"] + rgb_results["loss"]
+                if rgb_aux_loss_enabled:
+                    micro_rgb_batch = float(latents.shape[0])
+                    accumulation_rgb_sample_count += micro_rgb_batch
+                    accumulation_rgb_l1_sum += (
+                        float(rgb_results["l1_loss"].detach().item()) * micro_rgb_batch
+                    )
+                    accumulation_rgb_lpips_sum += (
+                        float(rgb_results["lpips_loss"].detach().item()) * micro_rgb_batch
+                    )
+                    accumulation_rgb_total_sum += (
+                        float(rgb_results["loss"].detach().item()) * micro_rgb_batch
+                    )
                 if phi is not None:
                     micro_active = float(phi_results["active_count"].detach().item())
                     micro_batch = float(latents.shape[0])
@@ -737,12 +790,50 @@ def main() -> None:
                 loss_value = accelerator.gather(loss.detach().reshape(1)).mean().item()
                 logs = {
                     "train_loss": loss_value,
+                    "diffusion_loss": accelerator.gather(
+                        diffusion_loss.detach().reshape(1)
+                    ).mean().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                 }
+                if rgb_aux_loss_enabled:
+                    gathered_rgb_count = accelerator.gather(
+                        torch.tensor(
+                            [accumulation_rgb_sample_count], device=latents.device
+                        )
+                    ).sum()
+
+                    def gathered_rgb_sum(value: float) -> torch.Tensor:
+                        return accelerator.gather(
+                            torch.tensor([value], device=latents.device)
+                        ).sum()
+
+                    logs.update(
+                        {
+                            "rgb_l1_loss": float(
+                                (
+                                    gathered_rgb_sum(accumulation_rgb_l1_sum)
+                                    / gathered_rgb_count.clamp_min(1)
+                                ).item()
+                            ),
+                            "rgb_lpips_loss": float(
+                                (
+                                    gathered_rgb_sum(accumulation_rgb_lpips_sum)
+                                    / gathered_rgb_count.clamp_min(1)
+                                ).item()
+                            ),
+                            "rgb_aux_loss": float(
+                                (
+                                    gathered_rgb_sum(accumulation_rgb_total_sum)
+                                    / gathered_rgb_count.clamp_min(1)
+                                ).item()
+                            ),
+                        }
+                    )
+                    accumulation_rgb_sample_count = 0.0
+                    accumulation_rgb_l1_sum = 0.0
+                    accumulation_rgb_lpips_sum = 0.0
+                    accumulation_rgb_total_sum = 0.0
                 if phi is not None:
-                    diffusion_value = accelerator.gather(
-                        diffusion_loss.detach().reshape(1)
-                    ).mean().item()
                     gathered_count = accelerator.gather(
                         torch.tensor([accumulation_active_count], device=latents.device)
                     ).sum()
@@ -763,7 +854,6 @@ def main() -> None:
 
                     logs.update(
                         {
-                            "diffusion_loss": diffusion_value,
                             "phi_z0_loss": float((gathered_sum(accumulation_phi_z0_sum) / gathered_count.clamp_min(1)).item()),
                             "phi_mu_loss": float((gathered_sum(accumulation_phi_mu_sum) / gathered_count.clamp_min(1)).item()),
                             "phi_lpips_loss": float((gathered_sum(accumulation_phi_lpips_sum) / gathered_count.clamp_min(1)).item()),

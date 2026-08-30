@@ -223,6 +223,24 @@ Each condition receives `sr_raw/`, optional previews, per-image metrics, and sum
 script performs generation and scoring in the same loop, so no separate inference or evaluator
 command is needed.
 
+### Cas-All checkpoint without the Cas inference branch
+
+`scripts/evaluate_cas_all_backbone_only.py` is the matching ablation for a trained Cas-All
+checkpoint. It loads that checkpoint's UNet LoRA and ConditionAdapter, but deliberately does not
+load or call latent phi or learned `r_t`. Inference therefore uses the original pipeline scheduler
+path while retaining the theta/adapter weights learned during Cas-All training. It evaluates every
+valid synthetic and real test pair and computes the metrics in the same process:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/evaluate_cas_all_backbone_only.py
+```
+
+Fixed paths and inference settings are declared at the top of the script. Results are written to
+`outputs/cas_all_backbone_only_benchmark/`; the main comparison is
+`summary_comparison.csv`, with per-condition images and metrics under `synthetic/` and `real/`.
+The per-sample seed rule matches `infer_stage1_latent_phi.py` (`seed + sorted test index`) so this
+run can be compared against full Cas-All inference without changing the diffusion noise.
+
 ## 10. Resume a checkpoint
 
 Resume restores LoRA, ConditionAdapter, optimizer, LR scheduler, step, and PyTorch RNG state:
