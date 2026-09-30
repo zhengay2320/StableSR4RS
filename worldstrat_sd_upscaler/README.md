@@ -426,3 +426,23 @@ python scripts/analyze_z0_reliability.py \
   --phi_timestep_range 0.0 0.2 \
   --num_samples 1 --timestep_stride 100 --skip_lpips
 ```
+
+## Optional three-input Stage-3 conditioning
+
+An opt-in Stage-3 path now combines processed RGB, an explicitly ordered
+twelve-band Sentinel-2 raster, and immutable offline `[F,U]` arrays. Existing
+YAML files and RGB-only artifacts keep their original behavior. The new path
+uses a finite five-shift internal spectral checker and registered
+zero-initialized multi-scale UNet residual bridges; it does not change the
+seven-channel x4-upscaler input contract or produce non-RGB output.
+
+The current `stage3_tri_input.yaml` uses the Stage-1 synthetic RGB pairs:
+`LR_bicubic -> GT_geo_rad_visual`, initialized from `outputs/stage1_synthetic/final`.
+Raw TIFFs and offline NPYs remain separate auxiliary inputs, never the source
+of RGB input or HR labels. Outputs go to `outputs/stage3_tri_input_synthetic`.
+
+See [TRI_INPUT_INTEGRATION.md](TRI_INPUT_INTEGRATION.md) for the strict data
+contract, unresolved fields that must be verified, precheck/statistics/warmup
+commands, Stage-3 training, independent validation, GT-free whole-image and
+tiled inference, checkpoint rules, and the scientific limits of the heuristic
+checker.

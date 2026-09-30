@@ -20,6 +20,7 @@ dependencies = [
   "tqdm",
   "tensorboard",
   "scikit-image",
+  "rasterio",
 ]
 
 [project.optional-dependencies]
@@ -37,4 +38,3 @@ addopts = "--strict-markers"
 [tool.ruff]
 line-length = 120
 target-version = "py310"
-

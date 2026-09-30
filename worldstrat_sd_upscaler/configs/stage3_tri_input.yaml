@@ -1,0 +1,115 @@
+model_id: /data/zhengay/models/stabilityaistable-diffusion-x4-upscaler
+data_root: /data/zhengay/EDiffSR-main/data/EDiffSR_worldstrat_rgb_x4_per_image
+# RGB input/target follow Stage 1; raw TIFFs are auxiliary observations only.
+train_lr_subdir: LR_bicubic
+val_lr_subdir: LR_bicubic
+test_lr_subdir: LR_bicubic
+gt_subdir: GT_geo_rad_visual
+output_dir: outputs/stage3_tri_input_synthetic
+init_lora_path: outputs/stage1_synthetic/final
+init_adapter_path: outputs/stage1_synthetic/final
+gt_crop_size: 512
+scale: 4
+train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 2.0e-5
+adapter_learning_rate: 5.0e-5
+tri_input_learning_rate: 1.0e-4
+max_train_steps: 10000
+mixed_precision: fp16
+lora_rank: 16
+lora_alpha: 16
+lora_dropout: 0.05
+adapter_scale: 1.0
+low_res_noise_level_min: 0
+low_res_noise_level_max: 15
+prompt_mode: fixed
+prompt_dropout_probability: 0.1
+# LR_bicubic is the primary RGB source, not a random replacement of real LR.
+synthetic_replay_probability: 0.0
+snr_gamma: 5.0
+validation_steps: 500
+validation_num_samples: 5
+validation_num_inference_steps: 40
+validation_noise_level: 10
+validation_guidance_scale: 1.0
+checkpointing_steps: 500
+checkpoints_total_limit: 3
+seed: 42
+num_workers: 4
+gradient_checkpointing: true
+enable_xformers_memory_efficient_attention: false
+use_8bit_adam: false
+strict_pairs: true
+augment: true
+resize_low_res_condition_if_needed: false
+lr_scheduler: constant
+lr_warmup_steps: 0
+max_grad_norm: 1.0
+phi_enabled: false
+rgb_aux_loss_enabled: false
+
+tri_input:
+  enabled: true
+  module_version: 1
+  training_stage: diffusion
+  train_existing_lora: false
+  train_existing_condition_adapter: false
+  synthetic_aux_policy: error
+  preview_loss_weight: 0.0
+  init_conditioner_path: outputs/tri_input_synthetic_warmup_b/final
+  data:
+    train:
+      raw_ms_dir: /data/zhengay/EDiffSR-main/data/new_star/train/lr
+      unmixing_dir: /data/zhengay/EDiffSR-main/data/new_star/train/lr_unmixing
+      manifest_path: null
+      recursive: false
+    val:
+      raw_ms_dir: /data/zhengay/EDiffSR-main/data/new_star/val/lr
+      unmixing_dir: /data/zhengay/EDiffSR-main/data/new_star/val/lr_unmixing
+      manifest_path: null
+      recursive: false
+    test:
+      raw_ms_dir: /data/zhengay/EDiffSR-main/data/new_star/test/lr
+      unmixing_dir: /data/zhengay/EDiffSR-main/data/new_star/test/lr_unmixing
+      manifest_path: null
+      recursive: false
+  # Must be replaced after inspecting actual TIFF metadata. The code requires
+  # exactly the 12 unique L2A bands and never guesses order from channel count.
+  band_names:
+    - B1
+    - B2
+    - B3
+    - B4
+    - B5
+    - B6
+    - B7
+    - B8
+    - B8A
+    - B9
+    - B11
+    - B12
+
+    # 当前数据已经是浮点反射率，保持数值不变
+  raw_value_conversion:
+    mode: identity
+    scale: 1.0
+    offset: 0.0
+    input_units: reflectance
+    output_units: reflectance
+  # Produced from train raw_ms only by scripts/compute_raw_band_stats.py.
+  raw_stats_path: outputs/tri_input_data_check/raw_band_stats.json
+  components: 8
+  bridge_hidden_channels: 64
+  checker:
+    enabled: true
+    scale: 4
+    common_factor: 2
+    window: 8
+    stride: 4
+    max_shift_hr: 1.0
+    ridge: 0.0001
+    movement_penalty: 0.0001
+    min_relative_gain: 0.02
+    min_relative_gap: 0.005
+    absolute_gain_floor: 0.0000001

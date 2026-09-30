@@ -11,6 +11,6 @@ PyYAML
 tqdm
 tensorboard
 scikit-image
+rasterio
 lpips
 pytest
-

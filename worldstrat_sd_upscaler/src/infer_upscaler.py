@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +22,26 @@ if __package__ in {None, ""}:
 
 from src.condition_adapter import ConditionAdapter
 from src.dataset import SUPPORTED_EXTENSIONS
+from src.tri_input_bridge import (
+    TriConditionedUNet,
+    TriInputBridge,
+    pipeline_cross_attention_kwargs,
+)
+from src.tri_input_conditioner import (
+    TRI_INPUT_CONFIG_NAME,
+    TRI_INPUT_WEIGHTS_NAME,
+    TriInputConditioner,
+)
+from src.tri_input_data import (
+    AuxiliaryPair,
+    RawBandStats,
+    RawValueConversion,
+    build_auxiliary_pairs,
+    load_auxiliary_pair,
+    load_raw_band_stats,
+    validate_sentinel2_l2a_band_names,
+)
+from src.tri_input_runtime import prepare_tri_condition, tri_diagnostic_metrics
 from src.utils import (
     FIXED_PROMPT,
     NEGATIVE_PROMPT,
@@ -35,6 +57,24 @@ from src.utils import (
 
 LOGGER = logging.getLogger("infer")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True)
+class InferenceAuxiliary:
+    raw_ms: torch.Tensor
+    unmixing: torch.Tensor
+    raw_valid: torch.Tensor
+    raw_ms_path: Path
+    unmixing_path: Path
+
+
+@dataclass(frozen=True)
+class TriInferenceRuntime:
+    conditioner: TriInputConditioner
+    bridge: TriInputBridge
+    band_names: tuple[str, ...]
+    conversion: RawValueConversion
+    stats: RawBandStats
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +93,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter_path", type=Path, default=None, help="Advanced override for the adapter file/directory")
     parser.add_argument("--input_dir", type=Path, default=None, help="Arbitrary LR directory; independent of training data")
     parser.add_argument("--gt_dir", type=Path, default=None, help="Optional matching GT directory")
+    parser.add_argument(
+        "--split",
+        choices=("train", "val", "test"),
+        default=None,
+        help="Explicit auxiliary-data split when a tri-input checkpoint is enabled",
+    )
+    parser.add_argument("--raw_ms_dir", type=Path, default=None)
+    parser.add_argument("--unmixing_dir", type=Path, default=None)
+    parser.add_argument("--aux_manifest_path", type=Path, default=None)
+    parser.add_argument("--raw_stats_path", type=Path, default=None)
+    parser.add_argument("--aux_recursive", action="store_true")
+    parser.add_argument(
+        "--disable_tri_input",
+        action="store_true",
+        help="Explicit RGB-only ablation even when the artifact declares tri-input conditioning",
+    )
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--prompt_mode", choices=("fixed", "metadata"), default="fixed")
     parser.add_argument("--metadata_path", type=Path, default=None)
@@ -194,6 +250,141 @@ def _pad_to_multiple(image: Image.Image, multiple: int) -> tuple[Image.Image, tu
     return Image.fromarray(padded, mode="RGB"), original_size
 
 
+def _pad_auxiliary(
+    auxiliary: InferenceAuxiliary, target_height: int, target_width: int
+) -> InferenceAuxiliary:
+    """Pad auxiliary inputs without inventing observations in padded pixels."""
+
+    height, width = auxiliary.raw_ms.shape[-2:]
+    if auxiliary.unmixing.shape != (10, height, width):
+        raise ValueError(
+            f"Unmixing tensor shape {tuple(auxiliary.unmixing.shape)} does not match "
+            f"raw grid {(height, width)} for {auxiliary.unmixing_path}"
+        )
+    if auxiliary.raw_valid.shape != (1, height, width):
+        raise ValueError(
+            f"raw_valid shape {tuple(auxiliary.raw_valid.shape)} does not match raw grid "
+            f"{(height, width)} for {auxiliary.raw_ms_path}"
+        )
+    if target_height < height or target_width < width:
+        raise ValueError("Auxiliary padding target cannot be smaller than the source grid")
+    if (target_height, target_width) == (height, width):
+        return auxiliary
+    raw = torch.zeros(12, target_height, target_width, dtype=torch.float32)
+    raw[:, :height, :width] = auxiliary.raw_ms
+    valid = torch.zeros(1, target_height, target_width, dtype=torch.bool)
+    valid[:, :height, :width] = auxiliary.raw_valid
+    # F=0,U=1 is an explicit unknown prior in padding, not zero cover.
+    prior = torch.cat(
+        (
+            torch.zeros(5, target_height, target_width, dtype=torch.float32),
+            torch.ones(5, target_height, target_width, dtype=torch.float32),
+        ),
+        dim=0,
+    )
+    prior[:, :height, :width] = auxiliary.unmixing
+    return InferenceAuxiliary(
+        raw_ms=raw,
+        unmixing=prior,
+        raw_valid=valid,
+        raw_ms_path=auxiliary.raw_ms_path,
+        unmixing_path=auxiliary.unmixing_path,
+    )
+
+
+def _crop_auxiliary(
+    auxiliary: InferenceAuxiliary, left: int, top: int, width: int, height: int
+) -> InferenceAuxiliary:
+    right, bottom = left + width, top + height
+    raw_height, raw_width = auxiliary.raw_ms.shape[-2:]
+    if left < 0 or top < 0 or right > raw_width or bottom > raw_height:
+        raise ValueError(
+            f"Auxiliary tile {(left, top, right, bottom)} exceeds raw grid "
+            f"{(raw_width, raw_height)} for {auxiliary.raw_ms_path}"
+        )
+    return InferenceAuxiliary(
+        raw_ms=auxiliary.raw_ms[:, top:bottom, left:right],
+        unmixing=auxiliary.unmixing[:, top:bottom, left:right],
+        raw_valid=auxiliary.raw_valid[:, top:bottom, left:right],
+        raw_ms_path=auxiliary.raw_ms_path,
+        unmixing_path=auxiliary.unmixing_path,
+    )
+
+
+def _load_inference_auxiliary(
+    pair: AuxiliaryPair,
+    runtime: TriInferenceRuntime,
+    expected_size: tuple[int, int],
+) -> InferenceAuxiliary:
+    raw, prior = load_auxiliary_pair(pair, runtime.band_names, runtime.conversion)
+    expected_hw = (expected_size[1], expected_size[0])
+    if tuple(raw.raw_ms.shape[-2:]) != expected_hw:
+        raise ValueError(
+            f"Tri-input grid mismatch for sample {pair.sample_id!r}: RGB={expected_hw}, "
+            f"raw={tuple(raw.raw_ms.shape[-2:])} ({pair.raw_ms_path}); silent resize is forbidden"
+        )
+    return InferenceAuxiliary(
+        raw_ms=raw.raw_ms,
+        unmixing=prior,
+        raw_valid=raw.raw_valid,
+        raw_ms_path=pair.raw_ms_path,
+        unmixing_path=pair.unmixing_path,
+    )
+
+
+def _tri_pipeline_kwargs(
+    pipe: Any,
+    runtime: TriInferenceRuntime,
+    image: Image.Image,
+    auxiliary: InferenceAuxiliary,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    guidance_scale: float,
+) -> dict[str, Any]:
+    if auxiliary.raw_ms.shape[-2:] != (image.height, image.width):
+        raise ValueError(
+            f"RGB/auxiliary condition shapes differ: RGB={(image.height, image.width)}, "
+            f"raw={tuple(auxiliary.raw_ms.shape[-2:])}"
+        )
+    rgb = pil_to_tensor(image, "minus_one_one").unsqueeze(0).to(
+        device=device, dtype=torch.float32
+    )
+    dummy = torch.empty(
+        (1, int(pipe.unet.config.in_channels), image.height, image.width),
+        device=device,
+        dtype=dtype,
+    )
+    prepared = prepare_tri_condition(
+        runtime.conditioner,
+        runtime.bridge,
+        rgb_minus_one_one=rgb,
+        raw_ms=auxiliary.raw_ms.unsqueeze(0).to(device=device, dtype=torch.float32),
+        unmixing=auxiliary.unmixing.unsqueeze(0).to(device=device, dtype=torch.float32),
+        raw_valid=auxiliary.raw_valid.unsqueeze(0).to(device=device).bool(),
+        aux_present=torch.ones(1, device=device, dtype=torch.bool),
+        unet_sample=dummy,
+        do_classifier_free_guidance=guidance_scale > 1.0,
+    )
+    if prepared is None:  # impossible for explicit inference observations
+        raise RuntimeError("Tri-input inference unexpectedly produced an inactive condition")
+    diagnostics = tri_diagnostic_metrics(prepared)
+    LOGGER.info(
+        "Tri-input checker for %s: valid_windows=%.1f accepted_fraction=%.4f "
+        "mean_shift_hr=%.4f internal_gain=%.6g reason=%s "
+        "(internal heuristic, not calibrated truth confidence)",
+        auxiliary.raw_ms_path.name,
+        float(diagnostics["checker_valid_windows"]),
+        float(diagnostics["checker_accepted_fraction"]),
+        float(diagnostics["checker_mean_shift_hr"]),
+        float(diagnostics["checker_internal_gain"]),
+        ",".join(prepared.output.checker_diagnostics.fallback_reasons),
+    )
+    return {
+        "cross_attention_kwargs": pipeline_cross_attention_kwargs(prepared.residuals)
+    }
+
+
 def _run_pipeline(
     pipe: Any,
     adapter: ConditionAdapter,
@@ -203,8 +394,17 @@ def _run_pipeline(
     generator: torch.Generator,
     device: torch.device,
     dtype: torch.dtype,
+    tri_runtime: TriInferenceRuntime | None = None,
+    auxiliary: InferenceAuxiliary | None = None,
 ) -> Image.Image:
     padded, original_size = _pad_to_multiple(image, int(pipe.vae_scale_factor))
+    padded_auxiliary: InferenceAuxiliary | None = None
+    if tri_runtime is not None:
+        if auxiliary is None:
+            raise ValueError("Tri-input checkpoint requires raw multispectral and unmixing inputs")
+        padded_auxiliary = _pad_auxiliary(auxiliary, padded.height, padded.width)
+    elif auxiliary is not None:
+        raise ValueError("Auxiliary input was supplied while tri-input inference is disabled")
     adapted = _adapt_image(adapter, padded, device, dtype)
     call: dict[str, Any] = {
         "prompt": prompt,
@@ -216,6 +416,18 @@ def _run_pipeline(
     }
     if args.guidance_scale > 1.0:
         call["negative_prompt"] = NEGATIVE_PROMPT
+    if tri_runtime is not None and padded_auxiliary is not None:
+        call.update(
+            _tri_pipeline_kwargs(
+                pipe,
+                tri_runtime,
+                padded,
+                padded_auxiliary,
+                device=device,
+                dtype=dtype,
+                guidance_scale=float(args.guidance_scale),
+            )
+        )
     result = pipe(**call).images[0]
     padded_expected = (padded.width * 4, padded.height * 4)
     if result.size != padded_expected:
@@ -237,9 +449,31 @@ def tiled_inference(
     device: torch.device,
     dtype: torch.dtype,
     image_seed: int,
+    tri_runtime: TriInferenceRuntime | None = None,
+    auxiliary: InferenceAuxiliary | None = None,
 ) -> Image.Image:
     """Infer overlapping LR tiles and blend their x4 outputs with a 2-D Hann window."""
     scale = 4
+    if image.width < args.tile_size or image.height < args.tile_size:
+        LOGGER.info(
+            "Image %s is smaller than tile_size=%d in at least one dimension; "
+            "using explicit whole-image inference without resizing",
+            image.size,
+            args.tile_size,
+        )
+        generator = torch.Generator(device=device).manual_seed(image_seed)
+        return _run_pipeline(
+            pipe,
+            adapter,
+            image,
+            prompt,
+            args,
+            generator,
+            device,
+            dtype,
+            tri_runtime,
+            auxiliary,
+        )
     xs = _positions(image.width, args.tile_size, args.tile_overlap)
     ys = _positions(image.height, args.tile_size, args.tile_overlap)
     hr_tile = args.tile_size * scale
@@ -251,8 +485,24 @@ def tiled_inference(
     for top in ys:
         for left in xs:
             tile = image.crop((left, top, left + args.tile_size, top + args.tile_size))
+            auxiliary_tile = (
+                _crop_auxiliary(auxiliary, left, top, args.tile_size, args.tile_size)
+                if auxiliary is not None
+                else None
+            )
             generator = torch.Generator(device=device).manual_seed(image_seed + tile_index)
-            sr_tile = _run_pipeline(pipe, adapter, tile, prompt, args, generator, device, dtype)
+            sr_tile = _run_pipeline(
+                pipe,
+                adapter,
+                tile,
+                prompt,
+                args,
+                generator,
+                device,
+                dtype,
+                tri_runtime,
+                auxiliary_tile,
+            )
             sr_tensor = pil_to_tensor(sr_tile).permute(1, 2, 0)
             hr_left, hr_top = left * scale, top * scale
             accumulation[hr_top : hr_top + hr_tile, hr_left : hr_left + hr_tile] += sr_tensor * weight
@@ -260,6 +510,141 @@ def tiled_inference(
             tile_index += 1
     blended = (accumulation / weights.clamp_min(1e-8)).clamp(0, 1).permute(2, 0, 1)
     return tensor_to_pil(blended)
+
+
+def _artifact_training_config(artifact_path: Path | None) -> dict[str, Any]:
+    if artifact_path is None:
+        return {}
+    path = artifact_path / "training_config.yaml"
+    return load_yaml_config(path) if path.is_file() else {}
+
+
+def _declares_tri_input(
+    artifact_path: Path | None,
+    cli_config: dict[str, Any],
+    artifact_config: dict[str, Any],
+) -> bool:
+    for source in (artifact_config, cli_config):
+        tri = source.get("tri_input")
+        if isinstance(tri, dict) and bool(tri.get("enabled", False)):
+            return True
+    if artifact_path is None:
+        return False
+    info_path = artifact_path / "model_info.json"
+    if info_path.is_file():
+        payload = json.loads(info_path.read_text(encoding="utf-8"))
+        if bool(payload.get("tri_input_enabled", False)):
+            return True
+    return (artifact_path / TRI_INPUT_CONFIG_NAME).is_file()
+
+
+def _load_tri_runtime(
+    artifact_path: Path,
+    pipe: Any,
+    *,
+    raw_stats_override: Path | None,
+    cli_config: dict[str, Any],
+    artifact_config: dict[str, Any],
+    device: torch.device,
+) -> TriInferenceRuntime:
+    required = (
+        artifact_path / TRI_INPUT_WEIGHTS_NAME,
+        artifact_path / TRI_INPUT_CONFIG_NAME,
+        artifact_path / "tri_input_bridges.safetensors",
+        artifact_path / "tri_input_bridge_config.json",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Checkpoint declares tri-input conditioning but required weights/configs are missing: "
+            + ", ".join(missing)
+        )
+    conditioner = TriInputConditioner.from_pretrained(artifact_path, device=device).eval()
+    bridge = TriInputBridge.from_pretrained(
+        artifact_path, unet=pipe.unet, device=device
+    ).eval()
+    metadata = conditioner.artifact_metadata
+    source_tri: dict[str, Any] = {}
+    for source in (artifact_config, cli_config):
+        candidate = source.get("tri_input")
+        if isinstance(candidate, dict):
+            source_tri.update(candidate)
+    band_names = metadata.get("band_names") or source_tri.get("band_names")
+    conversion_config = metadata.get("raw_value_conversion") or source_tri.get(
+        "raw_value_conversion"
+    )
+    layout = validate_sentinel2_l2a_band_names(band_names)
+    conversion = RawValueConversion.from_config(conversion_config)
+    stats_path = (
+        raw_stats_override.expanduser().resolve()
+        if raw_stats_override is not None
+        else artifact_path / "raw_band_stats.json"
+    )
+    stats = load_raw_band_stats(
+        stats_path,
+        expected_band_names=layout.band_names,
+        expected_conversion=conversion,
+    )
+    if not torch.equal(
+        conditioner.raw_mean.detach().cpu().flatten(),
+        torch.tensor(stats.mean, dtype=torch.float32),
+    ) or not torch.equal(
+        conditioner.raw_std.detach().cpu().flatten(),
+        torch.tensor(stats.std, dtype=torch.float32),
+    ):
+        raise ValueError(
+            f"Raw statistics {stats_path} do not match the conditioner checkpoint buffers"
+        )
+    pipe.unet = TriConditionedUNet(pipe.unet, bridge)
+    LOGGER.info(
+        "Loaded tri-input conditioner/bridge from %s with train-only stats %s",
+        artifact_path,
+        stats_path,
+    )
+    return TriInferenceRuntime(
+        conditioner=conditioner,
+        bridge=bridge,
+        band_names=layout.band_names,
+        conversion=conversion,
+        stats=stats,
+    )
+
+
+def _resolve_auxiliary_pairs(
+    args: argparse.Namespace,
+    files: list[Path],
+    cli_config: dict[str, Any],
+    artifact_config: dict[str, Any],
+) -> dict[str, AuxiliaryPair]:
+    if args.split is None:
+        raise ValueError(
+            "Tri-input inference requires explicit --split train|val|test; the split is never "
+            "guessed from input or checkpoint names"
+        )
+    split_config: dict[str, Any] = {}
+    for source in (artifact_config, cli_config):
+        tri = source.get("tri_input")
+        data = tri.get("data") if isinstance(tri, dict) else None
+        candidate = data.get(args.split) if isinstance(data, dict) else None
+        if isinstance(candidate, dict):
+            split_config.update(candidate)
+    raw_dir = args.raw_ms_dir or split_config.get("raw_ms_dir")
+    prior_dir = args.unmixing_dir or split_config.get("unmixing_dir")
+    if raw_dir is None or prior_dir is None:
+        raise ValueError(
+            f"Tri-input split={args.split!r} requires explicit --raw_ms_dir and "
+            "--unmixing_dir (or non-null paths for that exact split in YAML); no path is guessed"
+        )
+    manifest = args.aux_manifest_path or split_config.get("manifest_path")
+    recursive = bool(args.aux_recursive or split_config.get("recursive", False))
+    pairs = build_auxiliary_pairs(
+        [path.stem for path in files],
+        raw_dir,
+        prior_dir,
+        manifest_path=manifest,
+        recursive=recursive,
+    )
+    return {pair.sample_id: pair for pair in pairs}
 
 
 def main() -> None:
@@ -322,6 +707,35 @@ def main() -> None:
         LOGGER.warning("No --adapter_path supplied; using zero-initialized identity ConditionAdapter")
         adapter = ConditionAdapter(adapter_scale=float(config.get("adapter_scale", 1.0))).to(device=device, dtype=dtype).eval()
 
+    artifact_config = _artifact_training_config(artifact_path)
+    tri_declared = _declares_tri_input(artifact_path, config, artifact_config)
+    tri_runtime: TriInferenceRuntime | None = None
+    if tri_declared and not args.disable_tri_input:
+        if artifact_path is None:
+            raise ValueError(
+                "The configuration enables tri-input inference, but no --checkpoint_path artifact "
+                "was supplied for strict conditioner/bridge loading"
+            )
+        tri_runtime = _load_tri_runtime(
+            artifact_path,
+            pipe,
+            raw_stats_override=args.raw_stats_path,
+            cli_config=config,
+            artifact_config=artifact_config,
+            device=device,
+        )
+    elif tri_declared:
+        LOGGER.warning(
+            "Tri-input artifact explicitly disabled by --disable_tri_input; running the RGB-only ablation"
+        )
+    elif any(
+        value is not None
+        for value in (args.raw_ms_dir, args.unmixing_dir, args.aux_manifest_path, args.raw_stats_path)
+    ):
+        raise ValueError(
+            "Auxiliary paths were supplied, but the checkpoint does not declare tri-input weights"
+        )
+
     metadata_path = args.metadata_path
     if metadata_path is None:
         candidate = data_root / "metadata_final" / "final_metadata.csv"
@@ -336,17 +750,52 @@ def main() -> None:
         input_dir,
         f" using checkpoint {artifact_path}" if artifact_path is not None else "",
     )
+    auxiliary_pairs = (
+        _resolve_auxiliary_pairs(args, files, config, artifact_config)
+        if tri_runtime is not None
+        else {}
+    )
 
     for image_index, path in enumerate(tqdm(files, desc="inference")):
         with Image.open(path) as opened:
             lr_image = opened.convert("RGB")
         prompt = prompt_for(path.stem)
         image_seed = args.seed + image_index * 100_000
+        auxiliary = None
+        if tri_runtime is not None:
+            pair = auxiliary_pairs.get(path.stem)
+            if pair is None:
+                raise FileNotFoundError(
+                    f"No exact auxiliary mapping for inference sample {path.stem!r}: RGB={path}"
+                )
+            auxiliary = _load_inference_auxiliary(pair, tri_runtime, lr_image.size)
         if args.tiled:
-            sr = tiled_inference(pipe, adapter, lr_image, prompt, args, device, dtype, image_seed)
+            sr = tiled_inference(
+                pipe,
+                adapter,
+                lr_image,
+                prompt,
+                args,
+                device,
+                dtype,
+                image_seed,
+                tri_runtime,
+                auxiliary,
+            )
         else:
             generator = torch.Generator(device=device).manual_seed(image_seed)
-            sr = _run_pipeline(pipe, adapter, lr_image, prompt, args, generator, device, dtype)
+            sr = _run_pipeline(
+                pipe,
+                adapter,
+                lr_image,
+                prompt,
+                args,
+                generator,
+                device,
+                dtype,
+                tri_runtime,
+                auxiliary,
+            )
         expected = (lr_image.width * 4, lr_image.height * 4)
         if sr.size != expected:
             raise AssertionError(f"Output size check failed for {path.name}: SR={sr.size}, expected={expected}")

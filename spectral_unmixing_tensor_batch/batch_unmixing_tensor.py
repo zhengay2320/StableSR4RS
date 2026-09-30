@@ -82,7 +82,7 @@ from unmixing_core import SolverConfig
 HERE = Path(__file__).resolve().parent
 
 INPUT_DIR = Path(r"/data/zhengay/EDiffSR-main/data/new_star/train/lr")
-OUTPUT_DIR = Path(r"/data/zhengay/EDiffSR-main/data/new_star/test/train_unmixing")
+OUTPUT_DIR = Path(r"/data/zhengay/EDiffSR-main/data/new_star/test/lr_unmixing")
 
 # False：只扫描 INPUT_DIR 当前一级；True：递归扫描子目录。
 RECURSIVE = False

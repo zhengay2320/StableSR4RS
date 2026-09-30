@@ -160,6 +160,14 @@ class PairedSatelliteDataset(Dataset[dict[str, Any]]):
         prompt_dropout_probability: float = 0.0,
         augment: bool = True,
         validation_limit: int | None = None,
+        tri_input_enabled: bool = False,
+        raw_ms_dir: str | Path | None = None,
+        unmixing_dir: str | Path | None = None,
+        raw_band_names: list[str] | tuple[str, ...] | None = None,
+        raw_value_conversion: dict[str, Any] | None = None,
+        aux_manifest_path: str | Path | None = None,
+        aux_recursive: bool = False,
+        synthetic_aux_policy: str = "error",
     ) -> None:
         self.data_root = Path(data_root)
         self.split = split
@@ -171,6 +179,8 @@ class PairedSatelliteDataset(Dataset[dict[str, Any]]):
         self.prompt_mode = prompt_mode
         self.prompt_dropout_probability = float(prompt_dropout_probability)
         self.augment = augment and training
+        self.tri_input_enabled = bool(tri_input_enabled)
+        self.synthetic_aux_policy = str(synthetic_aux_policy)
 
         if self.gt_crop_size <= 0 or self.gt_crop_size % self.scale != 0:
             raise ValueError(
@@ -202,6 +212,49 @@ class PairedSatelliteDataset(Dataset[dict[str, Any]]):
             max_samples=validation_limit,
         )
         self.metadata = self._load_metadata(metadata_path)
+        self.auxiliary_pairs: dict[str, Any] = {}
+        self.raw_band_names: tuple[str, ...] | None = None
+        self.raw_value_conversion: Any | None = None
+        if self.tri_input_enabled:
+            from .tri_input_data import (
+                RawValueConversion,
+                build_auxiliary_pairs,
+                validate_sentinel2_l2a_band_names,
+            )
+
+            if self.synthetic_aux_policy not in {"error", "disable"}:
+                raise ValueError(
+                    "synthetic_aux_policy must be 'error' or 'disable' in tri-input mode"
+                )
+            if self.synthetic_replay_probability > 0 and self.synthetic_aux_policy == "error":
+                raise ValueError(
+                    "Tri-input data cannot pair real raw/unmixing observations with synthetic RGB replay. "
+                    "Set synthetic_replay_probability=0 (recommended), or explicitly set "
+                    "synthetic_aux_policy='disable' to disable the entire auxiliary branch for replay samples."
+                )
+            if raw_ms_dir is None or unmixing_dir is None:
+                raise ValueError(
+                    f"Tri-input split {split!r} requires explicit raw_ms_dir and unmixing_dir; "
+                    f"got raw_ms_dir={raw_ms_dir!r}, unmixing_dir={unmixing_dir!r}"
+                )
+            layout = validate_sentinel2_l2a_band_names(raw_band_names)
+            self.raw_band_names = layout.band_names
+            self.raw_value_conversion = RawValueConversion.from_config(raw_value_conversion)
+            auxiliary = build_auxiliary_pairs(
+                [record.sample_id for record in self.records],
+                raw_ms_dir,
+                unmixing_dir,
+                manifest_path=aux_manifest_path,
+                recursive=bool(aux_recursive),
+            )
+            self.auxiliary_pairs = {pair.sample_id: pair for pair in auxiliary}
+            LOGGER.info(
+                "Tri-input split=%s: RGB input=%s; RGB target=%s; auxiliary raw=%s; "
+                "auxiliary unmixing=%s. RGB input/target are read from their own files, "
+                "never extracted from raw bands; random replay probability=%.3f",
+                split, lr_dir, gt_dir, raw_ms_dir, unmixing_dir,
+                self.synthetic_replay_probability,
+            )
 
     def _load_metadata(self, metadata_path: str | Path | None) -> dict[str, dict[str, str]]:
         if self.prompt_mode != "metadata":
@@ -253,6 +306,12 @@ class PairedSatelliteDataset(Dataset[dict[str, Any]]):
         return FIXED_PROMPT
 
     def _aligned_crop(self, gt: Image.Image, lr: Image.Image, filename: str) -> tuple[Image.Image, Image.Image]:
+        lr_box, gt_box = self._aligned_crop_boxes(lr, filename)
+        return gt.crop(gt_box), lr.crop(lr_box)
+
+    def _aligned_crop_boxes(
+        self, lr: Image.Image, filename: str
+    ) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
         lr_width, lr_height = lr.size
         if lr_width < self.lr_crop_size or lr_height < self.lr_crop_size:
             raise ValueError(
@@ -267,22 +326,95 @@ class PairedSatelliteDataset(Dataset[dict[str, Any]]):
             top = (lr_height - self.lr_crop_size) // 2
         lr_box = (left, top, left + self.lr_crop_size, top + self.lr_crop_size)
         gt_box = tuple(coordinate * self.scale for coordinate in lr_box)
-        return gt.crop(gt_box), lr.crop(lr_box)
+        return lr_box, gt_box
 
     def _spatial_transform(self, gt: Image.Image, lr: Image.Image) -> tuple[Image.Image, Image.Image]:
+        mirror, flip, rotation = self._spatial_transform_parameters()
+        return self._apply_pil_transform(gt, mirror, flip, rotation), self._apply_pil_transform(
+            lr, mirror, flip, rotation
+        )
+
+    def _spatial_transform_parameters(self) -> tuple[bool, bool, int]:
         if not self.augment:
-            return gt, lr
-        if random.random() < 0.5:
-            gt, lr = ImageOps.mirror(gt), ImageOps.mirror(lr)
-        if random.random() < 0.5:
-            gt, lr = ImageOps.flip(gt), ImageOps.flip(lr)
-        rotation = random.choice((0, 90, 180, 270))
+            return False, False, 0
+        return random.random() < 0.5, random.random() < 0.5, random.choice((0, 90, 180, 270))
+
+    @staticmethod
+    def _apply_pil_transform(
+        image: Image.Image, mirror: bool, flip: bool, rotation: int
+    ) -> Image.Image:
+        if mirror:
+            image = ImageOps.mirror(image)
+        if flip:
+            image = ImageOps.flip(image)
         if rotation:
-            gt, lr = gt.rotate(rotation, expand=False), lr.rotate(rotation, expand=False)
-        return gt, lr
+            image = image.rotate(rotation, expand=False)
+        return image
+
+    @staticmethod
+    def _apply_tensor_transform(
+        tensor: torch.Tensor, mirror: bool, flip: bool, rotation: int
+    ) -> torch.Tensor:
+        if mirror:
+            tensor = torch.flip(tensor, dims=(-1,))
+        if flip:
+            tensor = torch.flip(tensor, dims=(-2,))
+        if rotation:
+            tensor = torch.rot90(tensor, k=rotation // 90, dims=(-2, -1))
+        return tensor.contiguous()
+
+    @staticmethod
+    def _missing_auxiliary_placeholders(
+        height: int, width: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raw = torch.zeros(12, height, width, dtype=torch.float32)
+        prior = torch.cat(
+            (
+                torch.zeros(5, height, width, dtype=torch.float32),
+                torch.ones(5, height, width, dtype=torch.float32),
+            ),
+            dim=0,
+        )
+        valid = torch.zeros(1, height, width, dtype=torch.bool)
+        return raw, prior, valid
+
+    def _load_auxiliary(
+        self, record: PairRecord, lr_size: tuple[int, int], use_synthetic: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, str, str]:
+        if use_synthetic:
+            if self.synthetic_aux_policy != "disable":
+                raise RuntimeError(
+                    f"Synthetic replay reached tri-input sample {record.sample_id!r} without "
+                    "synthetic_aux_policy='disable'"
+                )
+            raw, prior, valid = self._missing_auxiliary_placeholders(lr_size[1], lr_size[0])
+            return raw, prior, valid, False, "", ""
+
+        from .tri_input_data import load_auxiliary_pair
+
+        pair = self.auxiliary_pairs.get(record.sample_id)
+        if pair is None:
+            raise FileNotFoundError(
+                f"No auxiliary mapping is registered for sample {record.sample_id!r}; RGB={record.lr_path}"
+            )
+        raw_sample, prior = load_auxiliary_pair(
+            pair, self.raw_band_names, self.raw_value_conversion
+        )
+        raw = raw_sample.raw_ms
+        valid = raw_sample.raw_valid
+        expected_hw = (lr_size[1], lr_size[0])
+        if tuple(raw.shape[-2:]) != expected_hw or tuple(prior.shape[-2:]) != expected_hw:
+            raise ValueError(
+                f"Auxiliary grid mismatch for sample {record.sample_id!r}: RGB LR={expected_hw}, "
+                f"raw={tuple(raw.shape[-2:])} ({pair.raw_ms_path}), "
+                f"unmixing={tuple(prior.shape[-2:])} ({pair.unmixing_path}); silent resize is forbidden"
+            )
+        return raw, prior, valid, True, str(pair.raw_ms_path), str(pair.unmixing_path)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
+        # This flag means random replay only. A configured LR_bicubic primary
+        # input remains a regular paired RGB file with same-scene auxiliaries.
         use_synthetic = (
             self.training
             and record.synthetic_lr_path is not None
@@ -302,9 +434,27 @@ class PairedSatelliteDataset(Dataset[dict[str, Any]]):
             raise ValueError(
                 f"Pair geometry changed after validation for {record.filename!r}: GT={gt.size}, LR={lr.size}"
             )
-        gt, lr = self._aligned_crop(gt, lr, record.filename)
-        gt, lr = self._spatial_transform(gt, lr)
-        return {
+        lr_box, gt_box = self._aligned_crop_boxes(lr, record.filename)
+        raw: torch.Tensor | None = None
+        prior: torch.Tensor | None = None
+        raw_valid: torch.Tensor | None = None
+        aux_present = False
+        raw_path = ""
+        unmixing_path = ""
+        if self.tri_input_enabled:
+            raw, prior, raw_valid, aux_present, raw_path, unmixing_path = self._load_auxiliary(
+                record, lr.size, use_synthetic
+            )
+            left, top, right, bottom = lr_box
+            raw = raw[:, top:bottom, left:right]
+            prior = prior[:, top:bottom, left:right]
+            raw_valid = raw_valid[:, top:bottom, left:right]
+        gt = gt.crop(gt_box)
+        lr = lr.crop(lr_box)
+        mirror, flip, rotation = self._spatial_transform_parameters()
+        gt = self._apply_pil_transform(gt, mirror, flip, rotation)
+        lr = self._apply_pil_transform(lr, mirror, flip, rotation)
+        result: dict[str, Any] = {
             "gt": pil_to_tensor(gt, "minus_one_one"),
             "lr": pil_to_tensor(lr, "minus_one_one"),
             "prompt": self._prompt(record.sample_id),
@@ -312,3 +462,20 @@ class PairedSatelliteDataset(Dataset[dict[str, Any]]):
             "filename": record.filename,
             "source_type": source_type,
         }
+        if self.tri_input_enabled:
+            assert raw is not None and prior is not None and raw_valid is not None
+            result.update(
+                {
+                    "raw_ms": self._apply_tensor_transform(raw, mirror, flip, rotation),
+                    "unmixing": self._apply_tensor_transform(prior, mirror, flip, rotation),
+                    "raw_valid": self._apply_tensor_transform(raw_valid, mirror, flip, rotation),
+                    "aux_present": torch.tensor(aux_present, dtype=torch.bool),
+                    "raw_ms_path": raw_path,
+                    "unmixing_path": unmixing_path,
+                    "lr_crop_box": torch.tensor(lr_box, dtype=torch.long),
+                    "spatial_transform": torch.tensor(
+                        [int(mirror), int(flip), rotation // 90], dtype=torch.long
+                    ),
+                }
+            )
+        return result
