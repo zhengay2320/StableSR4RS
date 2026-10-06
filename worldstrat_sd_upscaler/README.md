@@ -429,6 +429,9 @@ python scripts/analyze_z0_reliability.py \
 
 ## Optional three-input Stage-3 conditioning
 
+For the complete Chinese training-to-evaluation workflow with literal server
+paths and no shell path variables, see [TRI_INPUT_RUNBOOK_ZH.md](TRI_INPUT_RUNBOOK_ZH.md).
+
 An opt-in Stage-3 path now combines processed RGB, an explicitly ordered
 twelve-band Sentinel-2 raster, and immutable offline `[F,U]` arrays. Existing
 YAML files and RGB-only artifacts keep their original behavior. The new path
